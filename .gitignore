@@ -1,0 +1,18 @@
+bin/
+obj/
+deps/
+dist/
+install.log
+
+# internal dev notes - keep local, never publish
+/BGCompBuilderIcon.png
+CHANGELOG*.md
+CURRENT-STATUS*.md
+HYPOTHESES*.md
+INSTALL-RELEASE.md
+NEXT-CHAT.md
+PERFORMANCE-CHECK.md
+RELEASE-NOTES*.md
+RUN-PERFORMANCE-CHECK.txt
+build-and-install-v27.bat
+docs/
