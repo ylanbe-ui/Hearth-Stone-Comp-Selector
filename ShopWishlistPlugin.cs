@@ -953,13 +953,13 @@ namespace HDTShopWishlist
         // it only deepens contrast slightly. (The previous art needed a strong lift because it
         // was thin line work keyed out of a glow-on-black export.)
         private const int RarityBadgeSize = 44;
-        private const double RarityBadgeAlphaGamma = 0.85;
+        private const double RarityBadgeAlphaGamma = 1.0;
         // Radius (as a fraction of the inscribed circle) where the badge's radial falloff starts.
-        // The sheets are cut from a 6x4 grid whose neighbouring glows overlap, so each frame is
-        // clipped square at the cell boundary - roughly r = 0.93 here. Fading just inside that
-        // turns the clip into a soft edge. Raise towards 1.0 to keep more halo, lower for a
-        // tighter star.
-        private const double RarityBadgeVignetteStart = 0.85;
+        // The extractor already cuts each frame on its detected sprite band and deletes anything
+        // connected to the window border, so bleed from neighbouring frames is gone before the
+        // art ships. Every tier's own content stops around r = 0.92-0.93, so this only trims
+        // outside all of it. Do NOT lower it much: at 0.70 it visibly clips the star's ray tips.
+        private const double RarityBadgeVignetteStart = 0.95;
 
         // Badge position, measured inwards from the highlight box's top-right corner. It used to
         // hang half outside the card (negative margins), which read as badly placed - it now sits
