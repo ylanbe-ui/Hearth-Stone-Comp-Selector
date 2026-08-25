@@ -657,7 +657,12 @@ namespace HDTShopWishlist
                 Canvas.SetZIndex(rarityIcon, 5);
                 root.Children.Add(border); root.Children.Add(tint); root.Children.Add(sheen); root.Children.Add(rarityIcon);
                 var glow = new DropShadowEffect { BlurRadius = 0, ShadowDepth = 0, Opacity = 0.0, Direction = 0 };
-                root.Effect = glow;
+                // Only attach the effect when the frame is actually drawn. A WPF Effect forces the
+                // whole subtree through an offscreen render pass on every redraw - including the
+                // badge's 12 frames per second - and it does that even at BlurRadius 0 and
+                // Opacity 0. With the frame suppressed there is nothing for it to render, so
+                // leaving it attached was pure cost.
+                if (ShowHighlightFrame) root.Effect = glow;
                 Canvas.SetZIndex(root, 500);
                 _boxes.Add(root); _glows.Add(glow); _canvas.Children.Add(root);
 
@@ -792,7 +797,9 @@ namespace HDTShopWishlist
             // Any old highlight with no corresponding live shop slot is immediately retired.
             for (int i = live.Count; i < MaxSlots; i++)
             {
+                if (_boxes[i].Visibility == Visibility.Collapsed && _slotVisualState[i].Length == 0) continue;
                 _boxes[i].Visibility = Visibility.Collapsed;
+                StopRarityAnimation(_boxes[i]);
                 _slotVisualState[i] = string.Empty;
                 _slotEntityKey[i] = string.Empty;
             }
@@ -1195,7 +1202,24 @@ namespace HDTShopWishlist
             _canvas.Width = Width;
             _canvas.Height = Height;
         }
-        private void HideAll(){ for(int i=0;i<_boxes.Count;i++){ _boxes[i].Visibility=Visibility.Collapsed; _slotVisualState[i]=string.Empty; _slotEntityKey[i]=string.Empty; } for(int i=0;i<_debugBoxes.Count;i++){ _debugBoxes[i].Visibility=Visibility.Collapsed; _debugLabels[i].Visibility=Visibility.Collapsed; } Opacity=0; }
+        // Stops a slot's badge loop. A RepeatBehavior.Forever animation keeps its clock running
+        // and keeps writing the property even when the element is collapsed, so a badge styled
+        // once went on costing ~12 property writes per second per slot for as long as HDT stayed
+        // open - main menu included. _slotVisualState is cleared alongside, so StyleBox
+        // reinstates the animation when the slot comes back.
+        private static void StopRarityAnimation(Grid root)
+        {
+            try
+            {
+                Image icon = root != null && root.Children.Count > 3 ? root.Children[3] as Image : null;
+                if (icon == null) return;
+                icon.BeginAnimation(Image.SourceProperty, null);
+                icon.Source = null;
+            }
+            catch { }
+        }
+
+        private void HideAll(){ for(int i=0;i<_boxes.Count;i++){ _boxes[i].Visibility=Visibility.Collapsed; StopRarityAnimation(_boxes[i]); _slotVisualState[i]=string.Empty; _slotEntityKey[i]=string.Empty; } for(int i=0;i<_debugBoxes.Count;i++){ _debugBoxes[i].Visibility=Visibility.Collapsed; _debugLabels[i].Visibility=Visibility.Collapsed; } Opacity=0; }
         public void HideForExternalFocus(){ HideAll(); }
         private void ApplyClickThrough(){ HwndSource s=PresentationSource.FromVisual(this) as HwndSource; if(s==null)return; IntPtr h=s.Handle; int ex=Native.GetWindowLong(h,Native.GWL_EXSTYLE); Native.SetWindowLong(h,Native.GWL_EXSTYLE,ex|Native.WS_EX_TRANSPARENT|Native.WS_EX_LAYERED|Native.WS_EX_TOOLWINDOW|Native.WS_EX_NOACTIVATE); }
         private void RegisterHotkey()
