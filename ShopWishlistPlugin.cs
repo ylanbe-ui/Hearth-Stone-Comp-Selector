@@ -276,7 +276,7 @@ namespace HDTShopWishlist
         public string Description { get { return "Visual Battlegrounds comp builder + live shop wishlist highlight + in-game comp panel."; } }
         public string ButtonText { get { return "Open / Toggle Comp Builder"; } }
         public string Author { get { return "Ylan Benainous"; } }
-        public Version Version { get { return new Version(0, 27, 0); } }
+        public Version Version { get { return new Version(0, 28, 0); } }
         public MenuItem MenuItem
         {
             get
