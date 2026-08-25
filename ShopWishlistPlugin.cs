@@ -648,8 +648,7 @@ namespace HDTShopWishlist
                     Width = RarityBadgeSize, Height = RarityBadgeSize, Stretch = Stretch.Uniform,
                     HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
                     Margin = new Thickness(0, -RarityBadgeSize / 2.0, -RarityBadgeSize / 2.0, 0),
-                    IsHitTestVisible = false,
-                    Effect = new DropShadowEffect { BlurRadius = 8, ShadowDepth = 0, Color = Colors.Black, Opacity = 0.85 }
+                    IsHitTestVisible = false
                 };
                 RenderOptions.SetBitmapScalingMode(rarityIcon, BitmapScalingMode.HighQuality);
                 Canvas.SetZIndex(rarityIcon, 5);
@@ -848,6 +847,23 @@ namespace HDTShopWishlist
                 rarityIcon.BeginAnimation(Image.SourceProperty, GetRarityAnimation(priority));
             }
 
+            // Badge-only presentation: the priority frame is suppressed, leaving just the sparkle
+            // over the card. All the frame styling below is left intact so this is a one-flag
+            // revert rather than a deletion.
+            if (!ShowHighlightFrame)
+            {
+                border.Visibility = Visibility.Collapsed;
+                tint.Visibility = Visibility.Collapsed;
+                sheen.BeginAnimation(Canvas.LeftProperty, null);
+                sheen.Opacity = 0;
+                sheen.Visibility = Visibility.Collapsed;
+                glow.BeginAnimation(DropShadowEffect.OpacityProperty, null);
+                glow.BeginAnimation(DropShadowEffect.BlurRadiusProperty, null);
+                glow.Opacity = 0.0;
+                glow.BlurRadius = 0;
+                return;
+            }
+
             // Fully static rendering: no Storyboards, no pulsing, no transform animation.
             glow.BeginAnimation(DropShadowEffect.OpacityProperty, null);
             glow.BeginAnimation(DropShadowEffect.BlurRadiusProperty, null);
@@ -938,6 +954,14 @@ namespace HDTShopWishlist
         // outer glow at very low alpha; a gamma < 1 lifts it so thin strokes survive downscaling.
         private const int RarityBadgeSize = 44;
         private const double RarityBadgeAlphaGamma = 0.55;
+        // Radius (as a fraction of the inscribed circle) where the badge's radial falloff starts.
+        // Lower = tighter, cleaner star; higher = keeps more of the surrounding glow but risks
+        // showing the source art's straight cut again.
+        private const double RarityBadgeVignetteStart = 0.55;
+
+        // Whether to draw the coloured priority frame around a highlighted card. Off: the sparkle
+        // badge alone marks the target. Flip to true to bring the whole frame treatment back.
+        private const bool ShowHighlightFrame = false;
 
         // Crops a frame down to its actual painted area and lifts its alpha. Important/Optional
         // frames only fill ~10-16% of their source canvas, so cropping alone makes the visible
@@ -958,6 +982,37 @@ namespace HDTShopWishlist
                 var px = new byte[stride * h];
                 bgra.CopyPixels(px, stride, 0);
 
+                for (int i = 3; i < px.Length; i += 4)
+                {
+                    int a = px[i];
+                    if (a > 0) px[i] = (byte)Math.Min(255.0, Math.Round(255.0 * Math.Pow(a / 255.0, RarityBadgeAlphaGamma)));
+                }
+
+                // The Core sheet was exported with the sparkle already running off its canvas
+                // (142 of 150 bottom-edge pixels opaque, 104 left, 121 right), so it ends in a hard
+                // straight cut that reads in game as a dark rectangle around the badge. Those
+                // pixels cannot be recovered, but a radial falloff retires the corners entirely,
+                // so what is left fades as a round glow instead of a cropped box. A plain
+                // border-band feather was tried first and was not enough - the Core art is a
+                // nearly square glow field, so only a radial mask removes the rectangle.
+                double cx = (w - 1) / 2.0, cy = (h - 1) / 2.0, rr = Math.Min(w, h) / 2.0;
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        int o = y * stride + x * 4 + 3;
+                        if (px[o] == 0) continue;
+                        double dx = x - cx, dy = y - cy;
+                        double r = Math.Sqrt(dx * dx + dy * dy) / rr;
+                        if (r <= RarityBadgeVignetteStart) continue;
+                        if (r >= 1.0) { px[o] = 0; continue; }
+                        double t = (r - RarityBadgeVignetteStart) / (1.0 - RarityBadgeVignetteStart);
+                        px[o] = (byte)(px[o] * (1.0 - t * t * (3.0 - 2.0 * t)));
+                    }
+                }
+
+                // Bounding box is measured after the mask, so the crop tracks what actually
+                // survives it and the sparkle fills more of its on-screen box.
                 int x0 = w, y0 = h, x1 = -1, y1 = -1;
                 for (int y = 0; y < h; y++)
                 {
@@ -969,11 +1024,6 @@ namespace HDTShopWishlist
                         if (y < y0) y0 = y;
                         if (y > y1) y1 = y;
                     }
-                }
-                for (int i = 3; i < px.Length; i += 4)
-                {
-                    int a = px[i];
-                    if (a > 0) px[i] = (byte)Math.Min(255.0, Math.Round(255.0 * Math.Pow(a / 255.0, RarityBadgeAlphaGamma)));
                 }
 
                 BitmapSource boosted = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgra32, null, px, stride);
