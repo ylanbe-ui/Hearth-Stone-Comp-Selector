@@ -940,24 +940,26 @@ namespace HDTShopWishlist
             }
         }
 
-        // Rarity-glow badge: a short looping sparkle animation shown top-right of a highlighted
-        // card, colored by priority (Core/Important/Optional). Frame timestamps below are the
-        // exact ones printed on each source reference sheet (Assets/RarityGlow/<tier>), not a
-        // uniform frame rate - some frames hold longer than others by design.
-        private static readonly double[] CoreFrameSeconds = { 0.00, 0.10, 0.20, 0.30, 0.40, 0.80, 0.85, 1.10, 1.30, 1.50, 1.70, 1.90, 2.00 };
-        private static readonly double[] BlueFrameSeconds = { 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70, 2.00 };
+        // Rarity-glow badge: a looping sparkle shown on a highlighted card, coloured by priority
+        // (Core/Important/Optional). The sheets are 24 evenly-timed frames cut from one 6x4 grid
+        // per tier, so the animation is a plain uniform frame rate over RarityBadgeLoopSeconds -
+        // no per-frame timestamp table.
+        private const double RarityBadgeLoopSeconds = 2.0;
         private static readonly Dictionary<int, ObjectAnimationUsingKeyFrames> RarityAnimationCache = new Dictionary<int, ObjectAnimationUsingKeyFrames>();
         private static readonly object RarityAnimationCacheLock = new object();
 
-        // On-screen size of the badge, and the alpha curve applied to its frames. The sheets were
-        // exported with alpha = max(R,G,B) from "glow on black" sources, which leaves the faint
-        // outer glow at very low alpha; a gamma < 1 lifts it so thin strokes survive downscaling.
+        // On-screen size of the badge, and the alpha curve applied to its frames. The current
+        // sheets ship a real alpha channel with bold, thick shapes, so the gamma lift is mild -
+        // it only deepens contrast slightly. (The previous art needed a strong lift because it
+        // was thin line work keyed out of a glow-on-black export.)
         private const int RarityBadgeSize = 44;
-        private const double RarityBadgeAlphaGamma = 0.55;
+        private const double RarityBadgeAlphaGamma = 0.85;
         // Radius (as a fraction of the inscribed circle) where the badge's radial falloff starts.
-        // Lower = tighter, cleaner star; higher = keeps more of the surrounding glow but risks
-        // showing the source art's straight cut again.
-        private const double RarityBadgeVignetteStart = 0.55;
+        // The sheets are cut from a 6x4 grid whose neighbouring glows overlap, so each frame is
+        // clipped square at the cell boundary - roughly r = 0.93 here. Fading just inside that
+        // turns the clip into a soft edge. Raise towards 1.0 to keep more halo, lower for a
+        // tighter star.
+        private const double RarityBadgeVignetteStart = 0.85;
 
         // Badge position, measured inwards from the highlight box's top-right corner. It used to
         // hang half outside the card (negative margins), which read as badly placed - it now sits
@@ -1054,19 +1056,19 @@ namespace HDTShopWishlist
                 if (RarityAnimationCache.TryGetValue(priority, out cached)) return cached;
 
                 string folder = priority == 1 ? "Core" : priority == 2 ? "Important" : "Optional";
-                double[] seconds = priority == 1 ? CoreFrameSeconds : BlueFrameSeconds;
                 string assemblyDir = IOPath.GetDirectoryName(typeof(ShopWishlistPlugin).Assembly.Location) ?? string.Empty;
                 string dir = IOPath.Combine(assemblyDir, "Assets", "RarityGlow", folder);
 
-                var anim = new ObjectAnimationUsingKeyFrames { Duration = TimeSpan.FromSeconds(2.0), RepeatBehavior = RepeatBehavior.Forever };
+                var anim = new ObjectAnimationUsingKeyFrames { Duration = TimeSpan.FromSeconds(RarityBadgeLoopSeconds), RepeatBehavior = RepeatBehavior.Forever };
                 try
                 {
                     string[] files = Directory.Exists(dir) ? Directory.GetFiles(dir, "frame_*.png").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray() : new string[0];
-                    for (int i = 0; i < files.Length && i < seconds.Length; i++)
+                    double step = files.Length > 0 ? RarityBadgeLoopSeconds / files.Length : 0.0;
+                    for (int i = 0; i < files.Length; i++)
                     {
                         BitmapSource bmp = LoadBadgeFrame(files[i]);
                         if (bmp == null) continue;
-                        anim.KeyFrames.Add(new DiscreteObjectKeyFrame(bmp, KeyTime.FromTimeSpan(TimeSpan.FromSeconds(seconds[i]))));
+                        anim.KeyFrames.Add(new DiscreteObjectKeyFrame(bmp, KeyTime.FromTimeSpan(TimeSpan.FromSeconds(i * step))));
                     }
                 }
                 catch { }
