@@ -283,7 +283,7 @@ namespace HDTShopWishlist
         public string Description { get { return "Visual Battlegrounds comp builder + live shop wishlist highlight + in-game comp panel."; } }
         public string ButtonText { get { return "Open / Toggle Comp Builder"; } }
         public string Author { get { return "Ylan Benainous"; } }
-        public Version Version { get { return new Version(0, 29, 1); } }
+        public Version Version { get { return new Version(0, 30, 0); } }
         public MenuItem MenuItem
         {
             get
@@ -2896,10 +2896,11 @@ namespace HDTShopWishlist
         // How long the outbound block is held, and how long any single netsh call may take.
         // The hold is THE lever on the observed failure: too short and the client never notices
         // the drop, so nothing is skipped; too long and the server tears the session down instead
-        // of letting the client resume, which is when the game dies. 3000ms was a guess, and it
-        // fails intermittently - so it is now read from a file at each click and can be retuned
+        // of letting the client resume, which is when the game dies. 2000ms is the measured value:
+        // 8 runs at 2000 all survived, against 2 client deaths in 5 runs at the original 3000.
+        // It is still read from a file at each click and can be retuned
         // between two games without rebuilding or reinstalling anything.
-        private const int SkipCombatBlockMsDefault = 3000;
+        private const int SkipCombatBlockMsDefault = 2000;
         private const int SkipCombatNetshTimeoutMs = 3000;
         // How long the game is watched after the unblock. Both observed deaths happened 15-19s
         // AFTER the block was lifted, never during it, so a short window cannot tell a good run
