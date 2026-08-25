@@ -638,12 +638,20 @@ namespace HDTShopWishlist
                 var border = new Border { BorderThickness = new Thickness(2.0), CornerRadius = new CornerRadius(6), Background = Brushes.Transparent, SnapsToDevicePixels = true };
                 var tint = new Border { Margin = new Thickness(3), CornerRadius = new CornerRadius(5), Background = Brushes.Transparent };
                 var sheen = new Border { Width = 12, HorizontalAlignment = HorizontalAlignment.Left, Background = CreateSheenBrush(), Opacity = 0 };
+                // RarityBadgeSize (44) rather than the original 26: the source sparkle art is
+                // thin-stroke line work covering only 10-16% of its canvas (Important/Optional),
+                // so at 26px the strokes fall below one pixel and average out to near-transparent
+                // grey - confirmed invisible in-game. The black drop shadow separates the badge
+                // from the busy shop art behind it.
                 var rarityIcon = new Image
                 {
-                    Width = 26, Height = 26, Stretch = Stretch.Uniform,
+                    Width = RarityBadgeSize, Height = RarityBadgeSize, Stretch = Stretch.Uniform,
                     HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
-                    Margin = new Thickness(0, -13, -13, 0), IsHitTestVisible = false
+                    Margin = new Thickness(0, -RarityBadgeSize / 2.0, -RarityBadgeSize / 2.0, 0),
+                    IsHitTestVisible = false,
+                    Effect = new DropShadowEffect { BlurRadius = 8, ShadowDepth = 0, Color = Colors.Black, Opacity = 0.85 }
                 };
+                RenderOptions.SetBitmapScalingMode(rarityIcon, BitmapScalingMode.HighQuality);
                 Canvas.SetZIndex(rarityIcon, 5);
                 root.Children.Add(border); root.Children.Add(tint); root.Children.Add(sheen); root.Children.Add(rarityIcon);
                 var glow = new DropShadowEffect { BlurRadius = 0, ShadowDepth = 0, Opacity = 0.0, Direction = 0 };
@@ -925,6 +933,62 @@ namespace HDTShopWishlist
         private static readonly Dictionary<int, ObjectAnimationUsingKeyFrames> RarityAnimationCache = new Dictionary<int, ObjectAnimationUsingKeyFrames>();
         private static readonly object RarityAnimationCacheLock = new object();
 
+        // On-screen size of the badge, and the alpha curve applied to its frames. The sheets were
+        // exported with alpha = max(R,G,B) from "glow on black" sources, which leaves the faint
+        // outer glow at very low alpha; a gamma < 1 lifts it so thin strokes survive downscaling.
+        private const int RarityBadgeSize = 44;
+        private const double RarityBadgeAlphaGamma = 0.55;
+
+        // Crops a frame down to its actual painted area and lifts its alpha. Important/Optional
+        // frames only fill ~10-16% of their source canvas, so cropping alone makes the visible
+        // sparkle substantially bigger at the same on-screen box.
+        private static BitmapSource LoadBadgeFrame(string path)
+        {
+            try
+            {
+                var src = new BitmapImage();
+                src.BeginInit();
+                src.CacheOption = BitmapCacheOption.OnLoad;
+                src.UriSource = new Uri(path, UriKind.Absolute);
+                src.EndInit();
+
+                // Straight (non-premultiplied) alpha, so raising alpha does not wash out the colour.
+                var bgra = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0.0);
+                int w = bgra.PixelWidth, h = bgra.PixelHeight, stride = w * 4;
+                var px = new byte[stride * h];
+                bgra.CopyPixels(px, stride, 0);
+
+                int x0 = w, y0 = h, x1 = -1, y1 = -1;
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        if (px[y * stride + x * 4 + 3] <= 8) continue;
+                        if (x < x0) x0 = x;
+                        if (x > x1) x1 = x;
+                        if (y < y0) y0 = y;
+                        if (y > y1) y1 = y;
+                    }
+                }
+                for (int i = 3; i < px.Length; i += 4)
+                {
+                    int a = px[i];
+                    if (a > 0) px[i] = (byte)Math.Min(255.0, Math.Round(255.0 * Math.Pow(a / 255.0, RarityBadgeAlphaGamma)));
+                }
+
+                BitmapSource boosted = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgra32, null, px, stride);
+                if (x1 < x0 || y1 < y0)
+                {
+                    if (boosted.CanFreeze) boosted.Freeze();
+                    return boosted;
+                }
+                var cropped = new CroppedBitmap(boosted, new Int32Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1));
+                if (cropped.CanFreeze) cropped.Freeze();
+                return cropped;
+            }
+            catch { return null; }
+        }
+
         private static ObjectAnimationUsingKeyFrames GetRarityAnimation(int priority)
         {
             lock (RarityAnimationCacheLock)
@@ -943,13 +1007,8 @@ namespace HDTShopWishlist
                     string[] files = Directory.Exists(dir) ? Directory.GetFiles(dir, "frame_*.png").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray() : new string[0];
                     for (int i = 0; i < files.Length && i < seconds.Length; i++)
                     {
-                        var bmp = new BitmapImage();
-                        bmp.BeginInit();
-                        bmp.CacheOption = BitmapCacheOption.OnLoad;
-                        bmp.UriSource = new Uri(files[i], UriKind.Absolute);
-                        bmp.DecodePixelWidth = 96;
-                        bmp.EndInit();
-                        bmp.Freeze();
+                        BitmapSource bmp = LoadBadgeFrame(files[i]);
+                        if (bmp == null) continue;
                         anim.KeyFrames.Add(new DiscreteObjectKeyFrame(bmp, KeyTime.FromTimeSpan(TimeSpan.FromSeconds(seconds[i]))));
                     }
                 }
