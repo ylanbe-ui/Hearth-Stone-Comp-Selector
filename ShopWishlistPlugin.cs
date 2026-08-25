@@ -647,7 +647,7 @@ namespace HDTShopWishlist
                 {
                     Width = RarityBadgeSize, Height = RarityBadgeSize, Stretch = Stretch.Uniform,
                     HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
-                    Margin = new Thickness(0, -RarityBadgeSize / 2.0, -RarityBadgeSize / 2.0, 0),
+                    Margin = new Thickness(0, RarityBadgeInsetY, RarityBadgeInsetX, 0),
                     IsHitTestVisible = false
                 };
                 RenderOptions.SetBitmapScalingMode(rarityIcon, BitmapScalingMode.HighQuality);
@@ -958,6 +958,13 @@ namespace HDTShopWishlist
         // Lower = tighter, cleaner star; higher = keeps more of the surrounding glow but risks
         // showing the source art's straight cut again.
         private const double RarityBadgeVignetteStart = 0.55;
+
+        // Badge position, measured inwards from the highlight box's top-right corner. It used to
+        // hang half outside the card (negative margins), which read as badly placed - it now sits
+        // inside the card art. For a badge centred on the card instead, switch the Image's
+        // alignments to Center and set both insets to 0.
+        private const double RarityBadgeInsetX = 4.0;
+        private const double RarityBadgeInsetY = 4.0;
 
         // Whether to draw the coloured priority frame around a highlighted card. Off: the sparkle
         // badge alone marks the target. Flip to true to bring the whole frame treatment back.
