@@ -20,3 +20,4 @@ docs/
 # personal Claude Code instructions - keep local
 CLAUDE.md
 build.log
+ART-PROMPT-*.md
