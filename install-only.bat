@@ -57,6 +57,10 @@ if exist "%ROOT%Assets\TribeIcons" (
   if not exist "%PLUGIN_DIR%\Assets\TribeIcons" mkdir "%PLUGIN_DIR%\Assets\TribeIcons" >nul 2>&1
   xcopy /e /i /y "%ROOT%Assets\TribeIcons" "%PLUGIN_DIR%\Assets\TribeIcons" >>"%LOG%" 2>&1 || goto :fail
 )
+if exist "%ROOT%Assets\RarityGlow" (
+  if not exist "%PLUGIN_DIR%\Assets\RarityGlow" mkdir "%PLUGIN_DIR%\Assets\RarityGlow" >nul 2>&1
+  xcopy /e /i /y "%ROOT%Assets\RarityGlow" "%PLUGIN_DIR%\Assets\RarityGlow" >>"%LOG%" 2>&1 || goto :fail
+)
 
 set "DLL_DIR="
 for %%F in ("%DLL%") do set "DLL_DIR=%%~dpF"

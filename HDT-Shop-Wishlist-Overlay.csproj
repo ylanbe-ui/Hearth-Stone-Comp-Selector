@@ -18,6 +18,7 @@
     <Resource Include="Assets\BGCompBuilderIcon.png" />
     <None Include="Assets\BGCompBuilderIcon.png" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Assets\TribeIcons\*.png" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\RarityGlow\**\*.png" CopyToOutputDirectory="PreserveNewest" />
     <Reference Include="HearthstoneDeckTracker">
       <HintPath>$(HDT_PATH)</HintPath>
       <Private>False</Private>

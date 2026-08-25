@@ -601,6 +601,30 @@ namespace HDTShopWishlist
         private (int left,int top,int width,int height) _stableRect;
         private bool _hasStableRect;
 
+        // Calibration aid (Ctrl+Shift+G): draws every shop slot's computed box, not just the
+        // highlighted one, with its index - so a single screenshot shows the whole row's
+        // alignment at once instead of needing one lucky screenshot per slot.
+        private bool _debugSlotsEnabled;
+        private readonly List<Border> _debugBoxes = new List<Border>();
+        private readonly List<TextBlock> _debugLabels = new List<TextBlock>();
+        private bool _dumpedShopCardShape;
+
+        private static void DumpObjectShape(object obj, string label)
+        {
+            if (obj == null) return;
+            string logPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_shopcard_shape.log");
+            using (var w = new StreamWriter(logPath, true))
+            {
+                w.WriteLine("=== " + label + " (" + obj.GetType().FullName + ") @ " + DateTime.Now + " ===");
+                foreach (var p in obj.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public).OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
+                {
+                    object val = null; string err = null;
+                    try { val = p.GetValue(obj, null); } catch (Exception ex) { err = ex.Message; }
+                    w.WriteLine("  " + p.Name + " : " + p.PropertyType.FullName + " = " + (err != null ? "<error: " + err + ">" : (val == null ? "null" : val.ToString())));
+                }
+            }
+        }
+
         public WishlistOverlayWindow(WishlistStore store, Action toggleSettings)
         {
             _store = store;
@@ -614,11 +638,25 @@ namespace HDTShopWishlist
                 var border = new Border { BorderThickness = new Thickness(2.0), CornerRadius = new CornerRadius(6), Background = Brushes.Transparent, SnapsToDevicePixels = true };
                 var tint = new Border { Margin = new Thickness(3), CornerRadius = new CornerRadius(5), Background = Brushes.Transparent };
                 var sheen = new Border { Width = 12, HorizontalAlignment = HorizontalAlignment.Left, Background = CreateSheenBrush(), Opacity = 0 };
-                root.Children.Add(border); root.Children.Add(tint); root.Children.Add(sheen);
+                var rarityIcon = new Image
+                {
+                    Width = 26, Height = 26, Stretch = Stretch.Uniform,
+                    HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
+                    Margin = new Thickness(0, -13, -13, 0), IsHitTestVisible = false
+                };
+                Canvas.SetZIndex(rarityIcon, 5);
+                root.Children.Add(border); root.Children.Add(tint); root.Children.Add(sheen); root.Children.Add(rarityIcon);
                 var glow = new DropShadowEffect { BlurRadius = 0, ShadowDepth = 0, Opacity = 0.0, Direction = 0 };
                 root.Effect = glow;
                 Canvas.SetZIndex(root, 500);
                 _boxes.Add(root); _glows.Add(glow); _canvas.Children.Add(root);
+
+                var debugBorder = new Border { BorderThickness = new Thickness(1.5), BorderBrush = Brushes.Lime, Background = Brushes.Transparent, Visibility = Visibility.Collapsed, IsHitTestVisible = false };
+                Canvas.SetZIndex(debugBorder, 600);
+                _debugBoxes.Add(debugBorder); _canvas.Children.Add(debugBorder);
+                var debugLabel = new TextBlock { Text = i.ToString(), Foreground = Brushes.Lime, Background = new SolidColorBrush(Color.FromArgb(160, 0, 0, 0)), FontSize = 11, FontWeight = FontWeights.Bold, Padding = new Thickness(2, 0, 2, 0), Visibility = Visibility.Collapsed, IsHitTestVisible = false };
+                Canvas.SetZIndex(debugLabel, 601);
+                _debugLabels.Add(debugLabel); _canvas.Children.Add(debugLabel);
             }
             Loaded += delegate { ApplyClickThrough(); RegisterHotkey(); };
             Closed += delegate { UnregisterHotkey(); };
@@ -676,6 +714,23 @@ namespace HDTShopWishlist
                 foreach (var c in pinningVm.ShopCards)
                     if (c != null && c.IsSlotOccupied && !string.IsNullOrWhiteSpace(c.CardId))
                         shopCardIds.Add(c.CardId);
+
+                // One-off investigation aid: the first time we see an occupied shop slot this
+                // session, dump every public member (name/type/value) of the ShopCards item and
+                // of the pinning view model itself - looking for a screen-space Rect/Point HDT's
+                // own "pin a shop card" UI must already use to line its badge up with the card,
+                // which we could reuse instead of our own guessed normalized-slot geometry.
+                if (!_dumpedShopCardShape)
+                {
+                    foreach (var c in pinningVm.ShopCards)
+                    {
+                        if (c == null || !c.IsSlotOccupied) continue;
+                        _dumpedShopCardShape = true;
+                        try { DumpObjectShape(c, "ShopCards[i] item"); } catch { }
+                        try { DumpObjectShape(pinningVm, "BattlegroundsMinionPinningViewModel"); } catch { }
+                        break;
+                    }
+                }
             }
             PlaceOver(rect.left, rect.top, rect.width, rect.height);
 
@@ -687,6 +742,24 @@ namespace HDTShopWishlist
             }
 
             var slots = BuildSlots(rect.width, rect.height, live.Count);
+
+            if (_debugSlotsEnabled)
+            {
+                for (int i = 0; i < MaxSlots; i++)
+                {
+                    if (i >= live.Count) { _debugBoxes[i].Visibility = Visibility.Collapsed; _debugLabels[i].Visibility = Visibility.Collapsed; continue; }
+                    PositionBox(_debugBoxes[i], slots[i], rect.width, rect.height);
+                    Canvas.SetLeft(_debugLabels[i], Canvas.GetLeft(_debugBoxes[i]));
+                    Canvas.SetTop(_debugLabels[i], Canvas.GetTop(_debugBoxes[i]) - 16);
+                    _debugBoxes[i].Visibility = Visibility.Visible;
+                    _debugLabels[i].Visibility = Visibility.Visible;
+                }
+            }
+            else if (_debugBoxes[0].Visibility != Visibility.Collapsed)
+            {
+                for (int i = 0; i < MaxSlots; i++) { _debugBoxes[i].Visibility = Visibility.Collapsed; _debugLabels[i].Visibility = Visibility.Collapsed; }
+            }
+
             // Rebuild the visible slot mapping from the live shop every tick.
             // This deliberately binds each highlight to the current slot content rather than
             // retaining a highlight by its previous visual slot. That fixes both purchased-card ghosts
@@ -760,6 +833,12 @@ namespace HDTShopWishlist
             Border border = root.Children[0] as Border;
             Border tint = root.Children[1] as Border;
             Border sheen = root.Children[2] as Border;
+            Image rarityIcon = root.Children.Count > 3 ? root.Children[3] as Image : null;
+            if (rarityIcon != null)
+            {
+                rarityIcon.BeginAnimation(Image.SourceProperty, null);
+                rarityIcon.BeginAnimation(Image.SourceProperty, GetRarityAnimation(priority));
+            }
 
             // Fully static rendering: no Storyboards, no pulsing, no transform animation.
             glow.BeginAnimation(DropShadowEffect.OpacityProperty, null);
@@ -834,6 +913,50 @@ namespace HDTShopWishlist
             {
                 glow.BeginAnimation(DropShadowEffect.OpacityProperty, null);
                 glow.Opacity = 0.0;
+            }
+        }
+
+        // Rarity-glow badge: a short looping sparkle animation shown top-right of a highlighted
+        // card, colored by priority (Core/Important/Optional). Frame timestamps below are the
+        // exact ones printed on each source reference sheet (Assets/RarityGlow/<tier>), not a
+        // uniform frame rate - some frames hold longer than others by design.
+        private static readonly double[] CoreFrameSeconds = { 0.00, 0.10, 0.20, 0.30, 0.40, 0.80, 0.85, 1.10, 1.30, 1.50, 1.70, 1.90, 2.00 };
+        private static readonly double[] BlueFrameSeconds = { 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70, 2.00 };
+        private static readonly Dictionary<int, ObjectAnimationUsingKeyFrames> RarityAnimationCache = new Dictionary<int, ObjectAnimationUsingKeyFrames>();
+        private static readonly object RarityAnimationCacheLock = new object();
+
+        private static ObjectAnimationUsingKeyFrames GetRarityAnimation(int priority)
+        {
+            lock (RarityAnimationCacheLock)
+            {
+                ObjectAnimationUsingKeyFrames cached;
+                if (RarityAnimationCache.TryGetValue(priority, out cached)) return cached;
+
+                string folder = priority == 1 ? "Core" : priority == 2 ? "Important" : "Optional";
+                double[] seconds = priority == 1 ? CoreFrameSeconds : BlueFrameSeconds;
+                string assemblyDir = IOPath.GetDirectoryName(typeof(ShopWishlistPlugin).Assembly.Location) ?? string.Empty;
+                string dir = IOPath.Combine(assemblyDir, "Assets", "RarityGlow", folder);
+
+                var anim = new ObjectAnimationUsingKeyFrames { Duration = TimeSpan.FromSeconds(2.0), RepeatBehavior = RepeatBehavior.Forever };
+                try
+                {
+                    string[] files = Directory.Exists(dir) ? Directory.GetFiles(dir, "frame_*.png").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray() : new string[0];
+                    for (int i = 0; i < files.Length && i < seconds.Length; i++)
+                    {
+                        var bmp = new BitmapImage();
+                        bmp.BeginInit();
+                        bmp.CacheOption = BitmapCacheOption.OnLoad;
+                        bmp.UriSource = new Uri(files[i], UriKind.Absolute);
+                        bmp.DecodePixelWidth = 96;
+                        bmp.EndInit();
+                        bmp.Freeze();
+                        anim.KeyFrames.Add(new DiscreteObjectKeyFrame(bmp, KeyTime.FromTimeSpan(TimeSpan.FromSeconds(seconds[i]))));
+                    }
+                }
+                catch { }
+                anim.Freeze();
+                RarityAnimationCache[priority] = anim;
+                return anim;
             }
         }
 
@@ -941,7 +1064,7 @@ namespace HDTShopWishlist
             return slots;
         }
 
-        private static void PositionBox(Grid box, (double x,double y,double w,double h) slot, double width, double height)
+        private static void PositionBox(FrameworkElement box, (double x,double y,double w,double h) slot, double width, double height)
         {
             double left = Math.Round(slot.x * width);
             double top = Math.Round(slot.y * height);
@@ -968,7 +1091,7 @@ namespace HDTShopWishlist
             _canvas.Width = Width;
             _canvas.Height = Height;
         }
-        private void HideAll(){ for(int i=0;i<_boxes.Count;i++){ _boxes[i].Visibility=Visibility.Collapsed; _slotVisualState[i]=string.Empty; _slotEntityKey[i]=string.Empty; } Opacity=0; }
+        private void HideAll(){ for(int i=0;i<_boxes.Count;i++){ _boxes[i].Visibility=Visibility.Collapsed; _slotVisualState[i]=string.Empty; _slotEntityKey[i]=string.Empty; } for(int i=0;i<_debugBoxes.Count;i++){ _debugBoxes[i].Visibility=Visibility.Collapsed; _debugLabels[i].Visibility=Visibility.Collapsed; } Opacity=0; }
         public void HideForExternalFocus(){ HideAll(); }
         private void ApplyClickThrough(){ HwndSource s=PresentationSource.FromVisual(this) as HwndSource; if(s==null)return; IntPtr h=s.Handle; int ex=Native.GetWindowLong(h,Native.GWL_EXSTYLE); Native.SetWindowLong(h,Native.GWL_EXSTYLE,ex|Native.WS_EX_TRANSPARENT|Native.WS_EX_LAYERED|Native.WS_EX_TOOLWINDOW|Native.WS_EX_NOACTIVATE); }
         private void RegisterHotkey()
@@ -982,6 +1105,12 @@ namespace HDTShopWishlist
                     // Manual troubleshooting hotkey: drop and reconnect the native Battlegrounds
                     // memory binding (tavern tier/faction rail) if it ever gets stuck.
                     Native.RegisterHotKey(h, 1339, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.R));
+                    // Calibration aid: toggle debug outlines on every shop slot (see _debugSlotsEnabled).
+                    Native.RegisterHotKey(h, 1340, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.G));
+                    // Investigation aid: dump Mono classes matching Tavern/Shop/Bacon to a log file.
+                    Native.RegisterHotKey(h, 1341, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.M));
+                    // Investigation aid: dump TB_BaconShop's field names/types to a log file.
+                    Native.RegisterHotKey(h, 1342, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.F));
                 }
                 HwndSource src = HwndSource.FromHwnd(h);
                 if (src != null) src.AddHook(WndProc);
@@ -993,6 +1122,9 @@ namespace HDTShopWishlist
         {
             try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1338); } catch { }
             try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1339); } catch { }
+            try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1340); } catch { }
+            try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1341); } catch { }
+            try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1342); } catch { }
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -1006,6 +1138,24 @@ namespace HDTShopWishlist
             {
                 handled = true;
                 try { BattlegroundsScryMemory.Instance.Disconnect(); } catch { }
+            }
+            else if (msg == Native.WM_HOTKEY && wParam.ToInt32() == 1340)
+            {
+                handled = true;
+                _debugSlotsEnabled = !_debugSlotsEnabled;
+                if (!_debugSlotsEnabled) for (int i = 0; i < _debugBoxes.Count; i++) { _debugBoxes[i].Visibility = Visibility.Collapsed; _debugLabels[i].Visibility = Visibility.Collapsed; }
+            }
+            else if (msg == Native.WM_HOTKEY && wParam.ToInt32() == 1341)
+            {
+                handled = true;
+                string logPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_classscan.log");
+                Task.Run(delegate { BattlegroundsScryMemory.Instance.DumpMatchingClassesToFile(logPath, "Tavern", "Shop", "Bacon"); });
+            }
+            else if (msg == Native.WM_HOTKEY && wParam.ToInt32() == 1342)
+            {
+                handled = true;
+                string logPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_fields.log");
+                Task.Run(delegate { BattlegroundsScryMemory.Instance.DumpClassFieldNamesToFile(logPath, "TB_BaconShop"); });
             }
             return IntPtr.Zero;
         }
@@ -4399,6 +4549,106 @@ namespace HDTShopWishlist
         public dynamic GetLeaderboardManager()
         {
             try { return Image?["PlayerLeaderboardManager"]?["s_instance"]; } catch { return null; }
+        }
+
+        // One-off investigation aid (Ctrl+Shift+M): dump every loaded Mono class whose full name
+        // contains any of the given needles, plus - for a few likely singleton-holder candidates -
+        // their instance field names/values, to a log file. Used to locate the real Tavern shop
+        // card manager instead of guessing screen coordinates.
+        public void DumpMatchingClassesToFile(string logPath, params string[] needles)
+        {
+            try
+            {
+                var img = Image;
+                using (var w = new StreamWriter(logPath, false))
+                {
+                    w.WriteLine("scan at " + DateTime.Now);
+                    if (img == null) { w.WriteLine("Image is null (no Hearthstone/Mono binding)."); return; }
+                    MonoClass[] classes;
+                    try { classes = img.getClasses(); } catch (Exception ex) { w.WriteLine("getClasses() failed: " + ex); return; }
+                    w.WriteLine("total classes: " + (classes == null ? 0 : classes.Length));
+                    if (classes == null) return;
+                    var matches = new List<string>();
+                    foreach (var c in classes)
+                    {
+                        string full = null;
+                        try { full = c.getFullName(); } catch { }
+                        if (string.IsNullOrEmpty(full)) continue;
+                        foreach (string needle in needles)
+                        {
+                            if (full.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) { matches.Add(full); break; }
+                        }
+                    }
+                    w.WriteLine("matches: " + matches.Count);
+                    foreach (string m in matches.OrderBy(s => s, StringComparer.OrdinalIgnoreCase)) w.WriteLine("  " + m);
+                }
+            }
+            catch (Exception ex) { try { File.WriteAllText(logPath, "DumpMatchingClassesToFile failed: " + ex); } catch { } }
+        }
+
+        // Dump a Mono class's FIELD DESCRIPTORS (names + declared types), no instance needed.
+        // Use this first to find the right static instance-holder field name before drilling in.
+        public void DumpClassFieldNamesToFile(string logPath, string className)
+        {
+            try
+            {
+                var img = Image;
+                using (var w = new StreamWriter(logPath, false))
+                {
+                    w.WriteLine("scan at " + DateTime.Now + " class=" + className);
+                    if (img == null) { w.WriteLine("Image is null."); return; }
+                    dynamic cls = img[className];
+                    if (cls == null) { w.WriteLine("class not found: " + className); return; }
+                    Dictionary<string, MonoClassField> fields;
+                    try { fields = (Dictionary<string, MonoClassField>)PluginReflection.TryInvoke(cls, "getFields", new object[0]); }
+                    catch (Exception ex) { w.WriteLine("getFields failed: " + ex); return; }
+                    if (fields == null) { w.WriteLine("getFields returned null"); return; }
+                    foreach (var kv in fields.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        string typeName = "?"; object staticVal = null; bool hasStatic = false;
+                        try { dynamic t = kv.Value.getType(); typeName = (string)PluginReflection.TryInvoke(t, "ToString", new object[0]) ?? t.ToString(); } catch { }
+                        try { staticVal = kv.Value.getStaticValue(); hasStatic = true; } catch { }
+                        w.WriteLine("  " + kv.Key + "  : " + typeName + (hasStatic ? ("   static=" + (staticVal == null ? "null" : staticVal.ToString())) : ""));
+                    }
+                }
+            }
+            catch (Exception ex) { try { File.WriteAllText(logPath, "DumpClassFieldNamesToFile failed: " + ex); } catch { } }
+        }
+
+        // Dump the instance field names/values of the live singleton (s_instance-style) for a
+        // given class full name, plus one level of drill-down into any field whose value looks
+        // like another Mono object (so we can walk toward card slot data without guessing blind).
+        public void DumpInstanceFieldsToFile(string logPath, string className, params string[] instanceFieldCandidates)
+        {
+            try
+            {
+                var img = Image;
+                using (var w = new StreamWriter(logPath, false))
+                {
+                    w.WriteLine("scan at " + DateTime.Now + " class=" + className);
+                    if (img == null) { w.WriteLine("Image is null."); return; }
+                    dynamic cls = img[className];
+                    if (cls == null) { w.WriteLine("class not found: " + className); return; }
+                    dynamic instance = null;
+                    foreach (string f in instanceFieldCandidates)
+                    {
+                        try { instance = cls[f]; if (instance != null) { w.WriteLine("instance via field: " + f); break; } } catch { }
+                    }
+                    if (instance == null) { w.WriteLine("no instance found via: " + string.Join(",", instanceFieldCandidates)); return; }
+                    Dictionary<string, object> fields;
+                    try { fields = (Dictionary<string, object>)PluginReflection.TryInvoke(instance, "getFields", new object[0]); }
+                    catch (Exception ex) { w.WriteLine("getFields failed: " + ex); return; }
+                    if (fields == null) { w.WriteLine("getFields returned null"); return; }
+                    foreach (var kv in fields.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        string valStr;
+                        try { valStr = kv.Value == null ? "null" : (kv.Value.ToString() + "  [" + kv.Value.GetType().FullName + "]"); }
+                        catch (Exception ex) { valStr = "<error: " + ex.Message + ">"; }
+                        w.WriteLine("  " + kv.Key + " = " + valStr);
+                    }
+                }
+            }
+            catch (Exception ex) { try { File.WriteAllText(logPath, "DumpInstanceFieldsToFile failed: " + ex); } catch { } }
         }
 
         public int GetDynamicCount(dynamic obj)
