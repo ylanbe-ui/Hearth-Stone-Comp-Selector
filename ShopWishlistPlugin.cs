@@ -2894,11 +2894,69 @@ namespace HDTShopWishlist
         }
         private const string SkipCombatFirewallRuleName = "HDTShopWishlist_SkipCombat_Temp";
         // How long the outbound block is held, and how long any single netsh call may take.
-        // Both are named so the hold can be tuned from the log's measured numbers instead of
-        // guessed: whether the client resumes into the shop or drops the session outright is a
-        // function of this duration against the server's own timeout.
-        private const int SkipCombatBlockMs = 3000;
+        // The hold is THE lever on the observed failure: too short and the client never notices
+        // the drop, so nothing is skipped; too long and the server tears the session down instead
+        // of letting the client resume, which is when the game dies. 3000ms was a guess, and it
+        // fails intermittently - so it is now read from a file at each click and can be retuned
+        // between two games without rebuilding or reinstalling anything.
+        private const int SkipCombatBlockMsDefault = 3000;
         private const int SkipCombatNetshTimeoutMs = 3000;
+        // How long the game is watched after the unblock. Both observed deaths happened 15-19s
+        // AFTER the block was lifted, never during it, so a short window cannot tell a good run
+        // from a bad one.
+        private const int SkipCombatWatchMs = 30000;
+
+        internal static string SkipCombatBlockMsPath
+        {
+            get
+            {
+                return IOPath.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "HDTShopWishlist", "skip-combat-ms.txt");
+            }
+        }
+
+        private static int ReadSkipCombatBlockMs()
+        {
+            try
+            {
+                string p = SkipCombatBlockMsPath;
+                int v;
+                if (File.Exists(p) && int.TryParse(File.ReadAllText(p).Trim(), out v) && v >= 200 && v <= 10000)
+                    return v;
+            }
+            catch { }
+            return SkipCombatBlockMsDefault;
+        }
+
+        // Labels each run in the log by itself, so a tuning session does not depend on anyone
+        // remembering which try crashed.
+        private static void MonitorOutcome(string runId, int pid, int blockMs)
+        {
+            if (pid <= 0) return;
+            Task.Run(async delegate
+            {
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    while (sw.ElapsedMilliseconds < SkipCombatWatchMs)
+                    {
+                        await Task.Delay(2000);
+                        bool alive;
+                        try { using (Process p = Process.GetProcessById(pid)) alive = !p.HasExited; }
+                        catch { alive = false; }
+                        if (!alive)
+                        {
+                            SkipLog("### OUTCOME " + runId + " = FAILED - Hearthstone (pid " + pid + ") exited "
+                                + sw.ElapsedMilliseconds + "ms after the unblock | blockMs=" + blockMs);
+                            return;
+                        }
+                    }
+                    SkipLog("### OUTCOME " + runId + " = OK - still alive " + SkipCombatWatchMs + "ms after the unblock | blockMs=" + blockMs);
+                }
+                catch (Exception ex) { SkipLog("### OUTCOME " + runId + " = UNKNOWN (" + ex.GetType().Name + ")"); }
+            });
+        }
         private bool _skipCombatBusy;
         private async void SkipCombatButtonClick(object sender, MouseButtonEventArgs e)
         {
@@ -2915,7 +2973,12 @@ namespace HDTShopWishlist
                 try { exePath = proc != null ? proc.MainModule.FileName : null; }
                 catch (Exception ex) { pathError = ex.GetType().Name + ": " + ex.Message; }
 
-                SkipLog("=== CLICK " + runId + " === elevated=" + IsProcessElevated()
+                int hsPid = proc != null ? proc.Id : 0;
+                int blockMs = ReadSkipCombatBlockMs();
+
+                SkipLog("=== CLICK " + runId + " === blockMs=" + blockMs
+                    + (blockMs == SkipCombatBlockMsDefault ? " (default)" : " (from skip-combat-ms.txt)")
+                    + " elevated=" + IsProcessElevated()
                     + " hearthstone=" + (proc == null ? "NOT RUNNING" : "pid " + proc.Id)
                     + " exePath=" + (string.IsNullOrWhiteSpace(exePath)
                         ? "<none>" + (pathError != null ? " (" + pathError + ")" : string.Empty)
@@ -2947,10 +3010,10 @@ namespace HDTShopWishlist
                         blockAdded = add.Started && !add.TimedOut && add.ExitCode == 0;
                         held.Start();
                     });
-                    SkipLog("  block installed=" + blockAdded + " - holding for " + SkipCombatBlockMs + "ms");
+                    SkipLog("  block installed=" + blockAdded + " - holding for " + blockMs + "ms");
                     // Sampled on a background thread so the measured hold stays honest.
-                    var during = Task.Run(async delegate { await Task.Delay(700); LogConnectionSample("during-block"); });
-                    try { await Task.Delay(SkipCombatBlockMs); }
+                    Task.Run(async delegate { await Task.Delay(Math.Min(700, blockMs / 2)); LogConnectionSample("during-block"); });
+                    try { await Task.Delay(blockMs); }
                     finally
                     {
                         await Task.Run(delegate
@@ -2960,18 +3023,18 @@ namespace HDTShopWishlist
                             // The real held duration, not the nominal one: netsh calls and thread
                             // scheduling both add to it, and that overshoot is the difference
                             // between landing in the shop and dropping the session.
-                            SkipLog("  block held for " + held.ElapsedMilliseconds + "ms actual (nominal " + SkipCombatBlockMs + ")");
+                            SkipLog("  block held for " + held.ElapsedMilliseconds + "ms actual (nominal " + blockMs + ")");
                             string detail;
                             SkipLog(SkipCombatRuleExists(out detail)
                                 ? "  !! RULE STILL PRESENT after unblock - Hearthstone stays firewalled. " + detail
                                 : "  rule confirmed removed");
                             LogConnectionSample("after-unblock");
                         });
-                        try { await during; } catch { }
-                        // One late sample: a connection dropped by the policy change may not
-                        // disappear from the table instantly.
-                        var late = Task.Run(async delegate { await Task.Delay(2500); LogConnectionSample("post+2.5s"); });
-                        try { await late; } catch { }
+                        // Fire and forget from here: the button must be usable again as soon as
+                        // the block is lifted. Awaiting the tail samples kept it locked for ~6s
+                        // instead of ~3.5s, which is a long time to be stuck mid-game.
+                        Task.Run(async delegate { await Task.Delay(2500); LogConnectionSample("post+2.5s"); });
+                        MonitorOutcome(runId, hsPid, blockMs);
                     }
                 }
             }
