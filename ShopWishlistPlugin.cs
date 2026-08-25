@@ -73,11 +73,18 @@ namespace HDTShopWishlist
             _lobbyInfo = new BattlegroundsLobbyInfoWindow();
             _lobbyInfo.Show();
 
+            // Records whether a previous Skip Combat left Hearthstone firewalled, then clears it.
+            BattlegroundsLobbyInfoWindow.LogSkipCombatStartupState();
+
             AutoUpdater.CheckAndPrepareAsync(Version, delegate (string payloadDir) { _pendingUpdatePayload = payloadDir; });
         }
 
         public void OnUnload()
         {
+            // First, before anything can throw: never leave the game blocked because the plugin
+            // was unloaded mid-run. This does not cover a hard kill or a crash - the startup
+            // check above is what catches those.
+            BattlegroundsLobbyInfoWindow.CleanupSkipCombatRule("plugin unload");
             _enabled = false;
             try { if (_settings != null) _settings.Close(); } catch { }
             _settings = null;
@@ -2862,18 +2869,39 @@ namespace HDTShopWishlist
             }
         }
         private const string SkipCombatFirewallRuleName = "HDTShopWishlist_SkipCombat_Temp";
+        // How long the outbound block is held, and how long any single netsh call may take.
+        // Both are named so the hold can be tuned from the log's measured numbers instead of
+        // guessed: whether the client resumes into the shop or drops the session outright is a
+        // function of this duration against the server's own timeout.
+        private const int SkipCombatBlockMs = 3000;
+        private const int SkipCombatNetshTimeoutMs = 3000;
         private bool _skipCombatBusy;
         private async void SkipCombatButtonClick(object sender, MouseButtonEventArgs e)
         {
             e.Handled = true; // don't let this also start a window drag
-            if (_skipCombatBusy) return;
+            if (_skipCombatBusy) { SkipLog("CLICK ignored - a run is already in progress"); return; }
             _skipCombatBusy = true;
+            string runId = Guid.NewGuid().ToString("N").Substring(0, 8);
+            var total = Stopwatch.StartNew();
             try
             {
                 Process proc = Process.GetProcessesByName("Hearthstone").FirstOrDefault();
                 string exePath = null;
-                try { exePath = proc != null ? proc.MainModule.FileName : null; } catch { }
-                if (!string.IsNullOrWhiteSpace(exePath))
+                string pathError = null;
+                try { exePath = proc != null ? proc.MainModule.FileName : null; }
+                catch (Exception ex) { pathError = ex.GetType().Name + ": " + ex.Message; }
+
+                SkipLog("=== CLICK " + runId + " === elevated=" + IsProcessElevated()
+                    + " hearthstone=" + (proc == null ? "NOT RUNNING" : "pid " + proc.Id)
+                    + " exePath=" + (string.IsNullOrWhiteSpace(exePath)
+                        ? "<none>" + (pathError != null ? " (" + pathError + ")" : string.Empty)
+                        : exePath));
+
+                if (string.IsNullOrWhiteSpace(exePath))
+                {
+                    SkipLog("  ABORT - no Hearthstone executable path, nothing was blocked");
+                }
+                else
                 {
                     // Real network cut (not a process freeze): a temporary Windows Firewall rule
                     // blocking Hearthstone.exe's traffic. The game keeps rendering/responding
@@ -2885,21 +2913,86 @@ namespace HDTShopWishlist
                     // is the likely cause of an observed game hang/crash with the previous version.
                     // Each RunNetsh call blocks synchronously on its own (WaitForExit); run the whole
                     // sequence on a background thread so a slow/hung netsh can never freeze the UI.
+                    bool blockAdded = false;
+                    var held = new Stopwatch();
                     await Task.Run(delegate
                     {
-                        RunNetsh("advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\"");
-                        RunNetsh("advfirewall firewall add rule name=\"" + SkipCombatFirewallRuleName + "\" dir=out program=\"" + exePath + "\" action=block enable=yes");
+                        LoggedNetsh("pre-delete", "advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\"");
+                        NetshResult add = LoggedNetsh("add-block", "advfirewall firewall add rule name=\"" + SkipCombatFirewallRuleName + "\" dir=out program=\"" + exePath + "\" action=block enable=yes");
+                        blockAdded = add.Started && !add.TimedOut && add.ExitCode == 0;
+                        held.Start();
                     });
-                    try { await Task.Delay(3000); }
-                    finally { await Task.Run(delegate { RunNetsh("advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\""); }); }
+                    SkipLog("  block installed=" + blockAdded + " - holding for " + SkipCombatBlockMs + "ms");
+                    try { await Task.Delay(SkipCombatBlockMs); }
+                    finally
+                    {
+                        await Task.Run(delegate
+                        {
+                            LoggedNetsh("unblock", "advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\"");
+                            held.Stop();
+                            // The real held duration, not the nominal one: netsh calls and thread
+                            // scheduling both add to it, and that overshoot is the difference
+                            // between landing in the shop and dropping the session.
+                            SkipLog("  block held for " + held.ElapsedMilliseconds + "ms actual (nominal " + SkipCombatBlockMs + ")");
+                            string detail;
+                            SkipLog(SkipCombatRuleExists(out detail)
+                                ? "  !! RULE STILL PRESENT after unblock - Hearthstone stays firewalled. " + detail
+                                : "  rule confirmed removed");
+                        });
+                    }
+                }
+            }
+            catch (Exception ex) { SkipLog("  EXCEPTION " + ex.GetType().Name + ": " + ex.Message); }
+            finally
+            {
+                _skipCombatBusy = false;
+                SkipLog("=== END " + runId + " === " + total.ElapsedMilliseconds + "ms total");
+            }
+        }
+
+        // ---- Skip Combat diagnostics -------------------------------------------------------
+        // The failure being chased is intermittent and, by design, happens while the game's
+        // network is cut - so the log must survive a disconnect, a hang, or HDT being killed
+        // outright. Every line is appended and closed immediately; nothing is allowed to sit in
+        // a buffer waiting for a graceful shutdown that may never come.
+        internal static readonly string SkipCombatLogPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_skipcombat.log");
+        private static readonly object SkipCombatLogLock = new object();
+
+        internal static void SkipLog(string line)
+        {
+            try
+            {
+                lock (SkipCombatLogLock)
+                {
+                    File.AppendAllText(SkipCombatLogPath,
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + line + Environment.NewLine);
                 }
             }
             catch { }
-            finally { _skipCombatBusy = false; }
         }
 
-        private static void RunNetsh(string arguments)
+        private sealed class NetshResult
         {
+            public bool Started;
+            public bool TimedOut;
+            public int ExitCode = -1;
+            public long ElapsedMs;
+            public string Output = string.Empty;
+            public string Error = string.Empty;
+        }
+
+        private static string Flatten(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            string one = s.Replace("\r", " ").Replace("\n", " / ").Trim();
+            while (one.Contains("  ")) one = one.Replace("  ", " ");
+            return one.Length > 300 ? one.Substring(0, 300) + "..." : one;
+        }
+
+        private static NetshResult RunNetsh(string arguments)
+        {
+            var r = new NetshResult();
+            var sw = Stopwatch.StartNew();
             try
             {
                 var psi = new ProcessStartInfo("netsh", arguments)
@@ -2909,7 +3002,90 @@ namespace HDTShopWishlist
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 };
-                using (Process p = Process.Start(psi)) { p.WaitForExit(3000); }
+                using (Process p = Process.Start(psi))
+                {
+                    r.Started = true;
+                    // Drain both pipes before waiting: a full pipe buffer would deadlock
+                    // WaitForExit, which would look exactly like the "netsh hung" case we are
+                    // trying to tell apart from a genuine failure.
+                    string so = p.StandardOutput.ReadToEnd();
+                    string se = p.StandardError.ReadToEnd();
+                    r.TimedOut = !p.WaitForExit(SkipCombatNetshTimeoutMs);
+                    r.Output = (so ?? string.Empty).Trim();
+                    r.Error = (se ?? string.Empty).Trim();
+                    if (!r.TimedOut) { try { r.ExitCode = p.ExitCode; } catch { } }
+                }
+            }
+            catch (Exception ex) { r.Error = ex.GetType().Name + ": " + ex.Message; }
+            r.ElapsedMs = sw.ElapsedMilliseconds;
+            return r;
+        }
+
+        private static NetshResult LoggedNetsh(string label, string arguments)
+        {
+            NetshResult r = RunNetsh(arguments);
+            SkipLog(string.Format("  {0,-12} exit={1} timedOut={2} {3}ms{4}{5}",
+                label,
+                r.Started ? r.ExitCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "NOT-STARTED",
+                r.TimedOut, r.ElapsedMs,
+                r.Output.Length > 0 ? " | out: " + Flatten(r.Output) : string.Empty,
+                r.Error.Length > 0 ? " | ERR: " + Flatten(r.Error) : string.Empty));
+            return r;
+        }
+
+        // netsh exits 0 and prints the rule when it exists; exits non-zero with "No rules match"
+        // when it does not. This is the check that tells an orphaned block apart from a clean run.
+        private static bool SkipCombatRuleExists(out string detail)
+        {
+            NetshResult r = RunNetsh("advfirewall firewall show rule name=\"" + SkipCombatFirewallRuleName + "\"");
+            detail = "exit=" + r.ExitCode + " out: " + Flatten(r.Output) + (r.Error.Length > 0 ? " ERR: " + Flatten(r.Error) : string.Empty);
+            return r.Started && !r.TimedOut && r.ExitCode == 0;
+        }
+
+        internal static bool IsProcessElevated()
+        {
+            try
+            {
+                using (var id = System.Security.Principal.WindowsIdentity.GetCurrent())
+                    return new System.Security.Principal.WindowsPrincipal(id)
+                        .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+            catch { return false; }
+        }
+
+        // Called once at plugin load. An orphaned rule found here means a previous Skip Combat
+        // never got to remove its block - HDT was closed, killed or crashed inside the hold
+        // window - and Hearthstone has been firewalled ever since. That is the single most
+        // likely explanation for "it disconnects me and I can't dismiss the reconnect prompt".
+        internal static void LogSkipCombatStartupState()
+        {
+            try
+            {
+                SkipLog("===== HDT START ===== elevated=" + IsProcessElevated());
+                string detail;
+                if (SkipCombatRuleExists(out detail))
+                {
+                    SkipLog("  !! ORPHANED BLOCK RULE FOUND AT STARTUP - Hearthstone was still firewalled. " + detail);
+                    LoggedNetsh("orphan-del", "advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\"");
+                    SkipLog(SkipCombatRuleExists(out detail) ? "  !! orphan removal FAILED. " + detail : "  orphan removed");
+                }
+                else
+                {
+                    SkipLog("  no leftover rule");
+                }
+            }
+            catch { }
+        }
+
+        internal static void CleanupSkipCombatRule(string reason)
+        {
+            try
+            {
+                string detail;
+                if (!SkipCombatRuleExists(out detail)) return;
+                SkipLog("CLEANUP (" + reason + ") - block rule still present, removing. " + detail);
+                LoggedNetsh("cleanup-del", "advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\"");
+                SkipLog(SkipCombatRuleExists(out detail) ? "  !! cleanup FAILED. " + detail : "  cleanup ok");
             }
             catch { }
         }
