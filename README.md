@@ -9,7 +9,7 @@ based on an active wishlist/comp, plus an in-game comp builder panel.
 
 ## Install (prebuilt)
 
-Grab the zip from the [latest release](../../releases/latest), extract it, and run `Install.bat`.
+Grab the zip from the [latest release](../../releases/latest), extract it, and run `Installer.bat`.
 
 Manual install: copy `HDT-Shop-Wishlist-Overlay.dll`, `untapped-scry-dotnet.dll` and `Assets/`
 into `%APPDATA%\HearthstoneDeckTracker\Plugins`.
