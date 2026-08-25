@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
     <PlatformTarget>x64</PlatformTarget>
     <Platforms>x64</Platforms>
-    <InformationalVersion>0.29.0</InformationalVersion>
+    <InformationalVersion>0.29.1</InformationalVersion>
     <OutputPath>bin\$(Configuration)\</OutputPath>
     <HDT_PATH>$(MSBuildProjectDirectory)\deps\HearthstoneDeckTracker.exe</HDT_PATH>
     <HEARTHDB_PATH>$(MSBuildProjectDirectory)\deps\HearthDb.dll</HEARTHDB_PATH>
