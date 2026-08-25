@@ -424,8 +424,16 @@ namespace HDTShopWishlist
         {
             if (index < 0 || index >= _compCount) return;
             BackupCompFile(index);
+            // Materialise BEFORE clearing. Callers build items as a lazy LINQ projection over this
+            // very dictionary - e.g. GetCompIds(i).Select(id => Tuple.Create(id, GetPriority(i, id))).
+            // GetCompIds() is eager (.ToArray()), but the Select is not: without this ToList the
+            // GetPriority calls would run during the loop below, i.e. after Clear(), miss every
+            // lookup, return 0, and ClampPriority(0) would rewrite every card as Core. That is
+            // exactly how a comp's Core/Important/Optional flattened to all-Core on switching tabs
+            // or removing a card, while the card list itself survived.
+            var snapshot = (items ?? Enumerable.Empty<Tuple<string,int>>()).ToList();
             _priority[index].Clear();
-            foreach (Tuple<string,int> t in items ?? Enumerable.Empty<Tuple<string,int>>())
+            foreach (Tuple<string,int> t in snapshot)
             {
                 if (t == null || string.IsNullOrWhiteSpace(t.Item1)) continue;
                 _priority[index][t.Item1.Trim()] = ClampPriority(t.Item2);
