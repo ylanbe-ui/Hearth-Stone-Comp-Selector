@@ -16,3 +16,6 @@ RELEASE-NOTES*.md
 RUN-PERFORMANCE-CHECK.txt
 build-and-install-v27.bat
 docs/
+
+# personal Claude Code instructions - keep local
+CLAUDE.md
