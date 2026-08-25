@@ -607,23 +607,11 @@ namespace HDTShopWishlist
         private bool _debugSlotsEnabled;
         private readonly List<Border> _debugBoxes = new List<Border>();
         private readonly List<TextBlock> _debugLabels = new List<TextBlock>();
-        private bool _dumpedShopCardShape;
-
-        private static void DumpObjectShape(object obj, string label)
-        {
-            if (obj == null) return;
-            string logPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_shopcard_shape.log");
-            using (var w = new StreamWriter(logPath, true))
-            {
-                w.WriteLine("=== " + label + " (" + obj.GetType().FullName + ") @ " + DateTime.Now + " ===");
-                foreach (var p in obj.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public).OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
-                {
-                    object val = null; string err = null;
-                    try { val = p.GetValue(obj, null); } catch (Exception ex) { err = ex.Message; }
-                    w.WriteLine("  " + p.Name + " : " + p.PropertyType.FullName + " = " + (err != null ? "<error: " + err + ">" : (val == null ? "null" : val.ToString())));
-                }
-            }
-        }
+        // The ShopCards shape dump that used to live here was investigation tooling for finding a
+        // screen-space Rect on HDT's pinning view model. Answered: there is none - only CardId,
+        // IsSlotOccupied, TribeIconRace and an unrelated RecommendedSectionCanvasLeft. It ran
+        // automatically and wrote to %TEMP% every session, so it is gone. The opt-in hotkey tools
+        // (Ctrl+Shift+G slot grid, Ctrl+Shift+M class scan, Ctrl+Shift+F field dump) are kept.
 
         public WishlistOverlayWindow(WishlistStore store, Action toggleSettings)
         {
@@ -721,23 +709,6 @@ namespace HDTShopWishlist
                 foreach (var c in pinningVm.ShopCards)
                     if (c != null && c.IsSlotOccupied && !string.IsNullOrWhiteSpace(c.CardId))
                         shopCardIds.Add(c.CardId);
-
-                // One-off investigation aid: the first time we see an occupied shop slot this
-                // session, dump every public member (name/type/value) of the ShopCards item and
-                // of the pinning view model itself - looking for a screen-space Rect/Point HDT's
-                // own "pin a shop card" UI must already use to line its badge up with the card,
-                // which we could reuse instead of our own guessed normalized-slot geometry.
-                if (!_dumpedShopCardShape)
-                {
-                    foreach (var c in pinningVm.ShopCards)
-                    {
-                        if (c == null || !c.IsSlotOccupied) continue;
-                        _dumpedShopCardShape = true;
-                        try { DumpObjectShape(c, "ShopCards[i] item"); } catch { }
-                        try { DumpObjectShape(pinningVm, "BattlegroundsMinionPinningViewModel"); } catch { }
-                        break;
-                    }
-                }
             }
             PlaceOver(rect.left, rect.top, rect.width, rect.height);
 

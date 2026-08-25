@@ -208,6 +208,17 @@ namespace HDTShopWishlist
             sb.AppendLine("if not exist \"" + pluginDir + "\" mkdir \"" + pluginDir + "\" >nul 2>&1");
             sb.AppendLine("copy /y \"" + Path.Combine(payloadDir, "HDT-Shop-Wishlist-Overlay.dll") + "\" \"" + Path.Combine(pluginDir, "HDT-Shop-Wishlist-Overlay.dll") + "\" >nul 2>&1");
             sb.AppendLine("if exist \"" + Path.Combine(payloadDir, "untapped-scry-dotnet.dll") + "\" copy /y \"" + Path.Combine(payloadDir, "untapped-scry-dotnet.dll") + "\" \"" + Path.Combine(pluginDir, "untapped-scry-dotnet.dll") + "\" >nul 2>&1");
+            // xcopy only adds and overwrites; it never removes. Any asset folder whose file set
+            // shrinks or gets renamed between releases would otherwise keep its stale files, and
+            // the plugin loads every frame_*.png it finds - so an updated user would end up
+            // animating a mix of old and new art. Clear each folder first, but only when the
+            // payload actually carries a replacement for it.
+            foreach (string assetFolder in new[] { "RarityGlow", "TribeIcons" })
+            {
+                string from = Path.Combine(payloadDir, "Assets", assetFolder);
+                string to = Path.Combine(pluginDir, "Assets", assetFolder);
+                sb.AppendLine("if exist \"" + from + "\" if exist \"" + to + "\" rmdir /s /q \"" + to + "\" >nul 2>&1");
+            }
             sb.AppendLine("if exist \"" + Path.Combine(payloadDir, "Assets") + "\" xcopy /e /i /y \"" + Path.Combine(payloadDir, "Assets") + "\" \"" + Path.Combine(pluginDir, "Assets") + "\\\" >nul 2>&1");
 
             string elevCmd = Path.Combine(Path.GetTempPath(), "hdt_elevate_" + Guid.NewGuid().ToString("N") + ".cmd");

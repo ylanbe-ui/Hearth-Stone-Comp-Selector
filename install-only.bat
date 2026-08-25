@@ -6,14 +6,14 @@ set "LOG=%ROOT%install.log"
 >"%LOG%" echo ===== HDT Shop Wishlist Overlay - install only %date% %time% =====
 
 rem This script does NOT build. It deploys the DLL already sitting in bin\Release\net472
-rem (built via build-and-install-v27.bat, or `dotnet msbuild ... /t:Rebuild`) to the HDT
+rem (built via MSBuild /t:Build - see CLAUDE.md) to the HDT
 rem Plugins folder, then restarts Hearthstone Deck Tracker.
 
 set "DLL="
 for /f "delims=" %%F in ('dir /b /s "%ROOT%bin\Release\net472\HDT-Shop-Wishlist-Overlay.dll" 2^>nul') do if not defined DLL set "DLL=%%F"
 if not defined DLL for /f "delims=" %%F in ('dir /b /s "%ROOT%bin\Release\HDT-Shop-Wishlist-Overlay.dll" 2^>nul') do if not defined DLL set "DLL=%%F"
 if not defined DLL (
-  echo ERROR: No built DLL found under %ROOT%bin\Release. Build first ^(build-and-install-v27.bat or dotnet msbuild /t:Rebuild^).
+  echo ERROR: No built DLL found under %ROOT%bin\Release. Build first ^(MSBuild /t:Build^).
   echo ERROR: No built DLL found.>>"%LOG%"
   goto :fail
 )
@@ -53,12 +53,18 @@ if exist "%ROOT%Assets\BGCompBuilderIcon.png" (
   if not exist "%PLUGIN_DIR%\Assets" mkdir "%PLUGIN_DIR%\Assets" >nul 2>&1
   copy /y "%ROOT%Assets\BGCompBuilderIcon.png" "%PLUGIN_DIR%\Assets\BGCompBuilderIcon.png" >>"%LOG%" 2>&1 || goto :fail
 )
+rem xcopy only adds and overwrites, it never removes. A frame set that shrinks or gets renamed
+rem would otherwise leave stale frames behind, and the plugin picks up every frame_*.png it
+rem finds - so the animation would silently run on a mix of old and new art. Clear the
+rem destination first, but only when the source actually has a replacement for it.
 if exist "%ROOT%Assets\TribeIcons" (
-  if not exist "%PLUGIN_DIR%\Assets\TribeIcons" mkdir "%PLUGIN_DIR%\Assets\TribeIcons" >nul 2>&1
+  if exist "%PLUGIN_DIR%\Assets\TribeIcons" rmdir /s /q "%PLUGIN_DIR%\Assets\TribeIcons" >nul 2>&1
+  mkdir "%PLUGIN_DIR%\Assets\TribeIcons" >nul 2>&1
   xcopy /e /i /y "%ROOT%Assets\TribeIcons" "%PLUGIN_DIR%\Assets\TribeIcons" >>"%LOG%" 2>&1 || goto :fail
 )
 if exist "%ROOT%Assets\RarityGlow" (
-  if not exist "%PLUGIN_DIR%\Assets\RarityGlow" mkdir "%PLUGIN_DIR%\Assets\RarityGlow" >nul 2>&1
+  if exist "%PLUGIN_DIR%\Assets\RarityGlow" rmdir /s /q "%PLUGIN_DIR%\Assets\RarityGlow" >nul 2>&1
+  mkdir "%PLUGIN_DIR%\Assets\RarityGlow" >nul 2>&1
   xcopy /e /i /y "%ROOT%Assets\RarityGlow" "%PLUGIN_DIR%\Assets\RarityGlow" >>"%LOG%" 2>&1 || goto :fail
 )
 
