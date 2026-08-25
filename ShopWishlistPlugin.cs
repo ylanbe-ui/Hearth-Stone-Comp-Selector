@@ -2915,6 +2915,7 @@ namespace HDTShopWishlist
                     // sequence on a background thread so a slow/hung netsh can never freeze the UI.
                     bool blockAdded = false;
                     var held = new Stopwatch();
+                    await Task.Run(delegate { LogConnectionSample("before-add"); });
                     await Task.Run(delegate
                     {
                         LoggedNetsh("pre-delete", "advfirewall firewall delete rule name=\"" + SkipCombatFirewallRuleName + "\"");
@@ -2923,6 +2924,8 @@ namespace HDTShopWishlist
                         held.Start();
                     });
                     SkipLog("  block installed=" + blockAdded + " - holding for " + SkipCombatBlockMs + "ms");
+                    // Sampled on a background thread so the measured hold stays honest.
+                    var during = Task.Run(async delegate { await Task.Delay(700); LogConnectionSample("during-block"); });
                     try { await Task.Delay(SkipCombatBlockMs); }
                     finally
                     {
@@ -2938,7 +2941,13 @@ namespace HDTShopWishlist
                             SkipLog(SkipCombatRuleExists(out detail)
                                 ? "  !! RULE STILL PRESENT after unblock - Hearthstone stays firewalled. " + detail
                                 : "  rule confirmed removed");
+                            LogConnectionSample("after-unblock");
                         });
+                        try { await during; } catch { }
+                        // One late sample: a connection dropped by the policy change may not
+                        // disappear from the table instantly.
+                        var late = Task.Run(async delegate { await Task.Delay(2500); LogConnectionSample("post+2.5s"); });
+                        try { await late; } catch { }
                     }
                 }
             }
@@ -3040,6 +3049,70 @@ namespace HDTShopWishlist
             NetshResult r = RunNetsh("advfirewall firewall show rule name=\"" + SkipCombatFirewallRuleName + "\"");
             detail = "exit=" + r.ExitCode + " out: " + Flatten(r.Output) + (r.Error.Length > 0 ? " ERR: " + Flatten(r.Error) : string.Empty);
             return r.Started && !r.TimedOut && r.ExitCode == 0;
+        }
+
+        // Processes whose live TCP connections are counted around each block. The question being
+        // answered is narrow: does anything OTHER than Hearthstone lose its connections at the
+        // exact moment the firewall rule is added or removed? A program-scoped outbound rule
+        // cannot block another process by design, so if Discord's count drops here, the cause is
+        // the policy change itself disturbing established flows, not the rule's scope.
+        private static readonly string[] SkipCombatWatchedProcesses = { "Hearthstone", "Discord", "HearthstoneDeckTracker" };
+
+        private static void LogConnectionSample(string label)
+        {
+            try
+            {
+                // netstat rather than a GetExtendedTcpTable interop: no elevation, no P/Invoke,
+                // and per-process counts are all this needs to prove or disprove the theory.
+                var psi = new ProcessStartInfo("netstat", "-ano")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                string text;
+                using (Process p = Process.Start(psi))
+                {
+                    text = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit(4000);
+                }
+
+                var perPid = new Dictionary<int, int>();
+                int total = 0;
+                foreach (string raw in text.Split('\n'))
+                {
+                    string line = raw.Trim();
+                    if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                    string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 4) continue;
+                    // State names are localised, so filter on the remote endpoint instead: a
+                    // listening socket has no peer. Locale-proof.
+                    string remote = parts[2];
+                    if (remote.EndsWith(":0") || remote.EndsWith("]:0")) continue;
+                    int pid;
+                    if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
+                    int c; perPid.TryGetValue(pid, out c); perPid[pid] = c + 1;
+                    total++;
+                }
+
+                var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                foreach (string n in SkipCombatWatchedProcesses) counts[n] = 0;
+                foreach (var kv in perPid)
+                {
+                    string name = null;
+                    try { using (Process pr = Process.GetProcessById(kv.Key)) name = pr.ProcessName; } catch { }
+                    if (name == null) continue;
+                    foreach (string n in SkipCombatWatchedProcesses)
+                        if (name.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0) counts[n] += kv.Value;
+                }
+
+                var sb = new StringBuilder();
+                foreach (string n in SkipCombatWatchedProcesses)
+                    sb.Append(n).Append('=').Append(counts[n]).Append("  ");
+                SkipLog("  conn " + label.PadRight(13) + sb + "allPeered=" + total);
+            }
+            catch (Exception ex) { SkipLog("  conn " + label + " sample FAILED: " + ex.GetType().Name + ": " + ex.Message); }
         }
 
         internal static bool IsProcessElevated()
