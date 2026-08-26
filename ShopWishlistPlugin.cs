@@ -1805,7 +1805,7 @@ namespace HDTShopWishlist
         private const double DefaultRailLeftRatio = 0.012;
         private const double DefaultRailTopRatio = 0.092;
         private const double PanelWidth = 94;
-        private const double SkipCombatButtonBlockHeight = 23;
+        private const double SkipCombatButtonBlockHeight = 34;
         private const int RefreshMs = 240;
         private const string PositionFileName = "bg-lobby-panel.position";
         private double _offsetXNorm;
@@ -1883,8 +1883,10 @@ namespace HDTShopWishlist
             var skipCombatButton = new Border
             {
                 Width = PanelWidth - 2,
-                Height = 20,
-                Margin = new Thickness(0, 0, 0, 3),
+                // Was 20px tall - a thin target to land a precise click on. Bumped to 30px
+                // (matching the block height below) so the whole clickable area is bigger.
+                Height = 30,
+                Margin = new Thickness(0, 0, 0, 4),
                 CornerRadius = new CornerRadius(5),
                 Background = new SolidColorBrush(Color.FromArgb(150, 18, 12, 28)),
                 BorderBrush = new SolidColorBrush(Color.FromArgb(170, 150, 95, 220)),
@@ -1895,7 +1897,7 @@ namespace HDTShopWishlist
                 {
                     Text = "⟲ Skip Combat",
                     Foreground = Brushes.White,
-                    FontSize = 10,
+                    FontSize = 11,
                     FontWeight = FontWeights.Bold,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center
