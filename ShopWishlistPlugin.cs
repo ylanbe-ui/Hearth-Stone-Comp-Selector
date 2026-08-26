@@ -1874,6 +1874,12 @@ namespace HDTShopWishlist
             MouseLeftButtonDown += HandleMouseDown;
             MouseMove += HandleMouseMove;
             MouseLeftButtonUp += HandleMouseUp;
+            // If the OS revokes our mouse capture mid-drag (a full-screen game grabbing input,
+            // an alt-tab, a display/DPI change recreating the HWND) MouseLeftButtonUp never fires.
+            // Without this, _dragging stays stuck true forever: ApplyPosition() stops repositioning
+            // the panel every tick, and every later click - including on Skip Combat - is treated
+            // as a fresh drag instead of reaching the button.
+            LostMouseCapture += HandleLostMouseCapture;
             var skipCombatButton = new Border
             {
                 Width = PanelWidth - 2,
@@ -3295,6 +3301,14 @@ namespace HDTShopWishlist
             if (e.ChangedButton != MouseButton.Left) return;
             FinishDrag();
             e.Handled = true;
+        }
+
+        private void HandleLostMouseCapture(object sender, MouseEventArgs e)
+        {
+            // Capture was revoked without a matching HandleMouseUp - clear the stuck flag but
+            // skip SavePosition(): the drag never reached a deliberate mouse-up, so the current
+            // Left/Top may not reflect where the user actually meant to drop the panel.
+            _dragging = false;
         }
 
         private void FinishDrag()
