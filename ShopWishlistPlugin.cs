@@ -70,7 +70,7 @@ namespace HDTShopWishlist
             _overlay.Show();
             _launcher = new InGameLauncherWindow(_store, ToggleBuilder);
             _launcher.Show();
-            _lobbyInfo = new BattlegroundsLobbyInfoWindow();
+            _lobbyInfo = new BattlegroundsLobbyInfoWindow(_store);
             _lobbyInfo.Show();
 
             // Records whether a previous Skip Combat left Hearthstone firewalled, then clears it.
@@ -283,7 +283,7 @@ namespace HDTShopWishlist
         public string Description { get { return "Visual Battlegrounds comp builder + live shop wishlist highlight + in-game comp panel."; } }
         public string ButtonText { get { return "Open / Toggle Comp Builder"; } }
         public string Author { get { return "Ylan Benainous"; } }
-        public Version Version { get { return new Version(0, 30, 0); } }
+        public Version Version { get { return new Version(0, 31, 0); } }
         public MenuItem MenuItem
         {
             get
@@ -310,7 +310,12 @@ namespace HDTShopWishlist
     internal sealed class WishlistStore
     {
         private readonly string _dir;
-        internal const int MaxComps = 8;
+        internal const int MaxComps = 32;
+        // The 10 Battlegrounds tribes always occupy indices [0, TribeSlotCount) in this exact
+        // order - fixed identity, never renamed, never deleted. Anything the user adds beyond
+        // them (via "+") is a custom comp living at index >= TribeSlotCount.
+        public static readonly string[] TribeSlotOrder = { "Beast", "Demon", "Dragon", "Elemental", "Mech", "Murloc", "Naga", "Pirate", "Quilboar", "Undead" };
+        public const int TribeSlotCount = 10;
         private readonly string[] _compPaths = new string[MaxComps];
         private readonly Dictionary<string, int>[] _priority = new Dictionary<string, int>[MaxComps];
         private readonly string[] _compNames = new string[MaxComps];
@@ -362,6 +367,170 @@ namespace HDTShopWishlist
             string active = IOPath.Combine(_dir, "active.txt");
             int a;
             if (int.TryParse(File.Exists(active) ? File.ReadAllText(active) : "0", out a) && a >= 0 && a < _compCount) _activeComp = a; else _activeComp = 0;
+
+            // The old cap was MaxComps=8, always < TribeSlotCount(10), so this can only be true
+            // once per install - after it runs, _compCount is permanently >= 10 and this never
+            // fires again. Safe to gate purely on the count, no separate migration flag needed.
+            if (_compCount < TribeSlotCount) MigrateToTribeSlots();
+
+            // Cheap invariant, always re-applied: the 10 tribe slots are never user-renamed, so
+            // their name always tracks TribeSlotOrder regardless of whatever is on disk.
+            for (int i = 0; i < TribeSlotCount; i++) _compNames[i] = TribeSlotOrder[i];
+        }
+
+        // One-time reshuffle from the old "arbitrary named comp list" layout into the new
+        // "10 fixed tribe slots + custom comps after them" layout. Runs only when _compCount is
+        // still below TribeSlotCount (see Load()). Backs up every existing comp file first since
+        // this reorders/renames live wishlist data and there is no undo once the new layout is
+        // written to disk.
+        private void MigrateToTribeSlots()
+        {
+            int oldCount = _compCount;
+            var oldNames = new string[oldCount];
+            var oldPriority = new Dictionary<string, int>[oldCount];
+            for (int i = 0; i < oldCount; i++) { oldNames[i] = _compNames[i]; oldPriority[i] = _priority[i]; }
+            int oldActive = _activeComp;
+
+            try
+            {
+                string backupDir = IOPath.Combine(_dir, "Backups", "pre-tribe-migration");
+                Directory.CreateDirectory(backupDir);
+                for (int i = 0; i < oldCount; i++)
+                {
+                    if (File.Exists(_compPaths[i])) File.Copy(_compPaths[i], IOPath.Combine(backupDir, "comp" + (i + 1) + ".txt"), true);
+                    string namePath = IOPath.Combine(_dir, "comp-name-" + (i + 1) + ".txt");
+                    if (File.Exists(namePath)) File.Copy(namePath, IOPath.Combine(backupDir, "comp-name-" + (i + 1) + ".txt"), true);
+                }
+            }
+            catch { }
+
+            var newPriority = new Dictionary<string, int>[MaxComps];
+            var newNames = new string[MaxComps];
+            for (int i = 0; i < TribeSlotCount; i++)
+            {
+                newPriority[i] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                newNames[i] = TribeSlotOrder[i];
+            }
+
+            var newIndexByOld = new int[oldCount];
+            for (int i = 0; i < oldCount; i++) newIndexByOld[i] = -1;
+            int nextCustom = TribeSlotCount;
+            for (int j = 0; j < oldCount; j++)
+            {
+                string tribe = MatchTribeName(oldNames[j]);
+                bool isEmpty = oldPriority[j] == null || oldPriority[j].Count == 0;
+                if (tribe != null)
+                {
+                    int slot = Array.IndexOf(TribeSlotOrder, tribe);
+                    if (slot >= 0)
+                    {
+                        foreach (var kv in oldPriority[j]) newPriority[slot][kv.Key] = kv.Value;
+                        newIndexByOld[j] = slot;
+                        continue;
+                    }
+                }
+                // Drop untouched default placeholders (e.g. a fresh install's empty "Comp 1/2/3")
+                // instead of carrying them forward as meaningless custom comps.
+                if (isEmpty) continue;
+                if (nextCustom >= MaxComps) continue;
+                newPriority[nextCustom] = oldPriority[j];
+                newNames[nextCustom] = oldNames[j];
+                newIndexByOld[j] = nextCustom;
+                nextCustom++;
+            }
+            for (int i = nextCustom; i < MaxComps; i++)
+            {
+                newPriority[i] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                newNames[i] = "Comp " + (i + 1);
+            }
+
+            for (int i = 0; i < MaxComps; i++) { _priority[i] = newPriority[i]; _compNames[i] = newNames[i]; }
+            _compCount = nextCustom;
+            _activeComp = (oldActive >= 0 && oldActive < oldCount && newIndexByOld[oldActive] >= 0) ? newIndexByOld[oldActive] : 0;
+
+            try
+            {
+                File.WriteAllText(IOPath.Combine(_dir, "comp-count.txt"), _compCount.ToString());
+                File.WriteAllText(IOPath.Combine(_dir, "active.txt"), _activeComp.ToString());
+                for (int i = 0; i < _compCount; i++)
+                {
+                    File.WriteAllLines(_compPaths[i], _priority[i].Select(kv => kv.Key + "|" + kv.Value));
+                    File.WriteAllText(IOPath.Combine(_dir, "comp-name-" + (i + 1) + ".txt"), _compNames[i]);
+                }
+                for (int i = _compCount; i < oldCount; i++)
+                {
+                    try { if (File.Exists(_compPaths[i])) File.Delete(_compPaths[i]); } catch { }
+                    try { string np = IOPath.Combine(_dir, "comp-name-" + (i + 1) + ".txt"); if (File.Exists(np)) File.Delete(np); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        // Matches a free-form comp name against the 10 canonical tribes, tolerating accents
+        // (e.g. "Démon") and small typos via consecutive-letter dedup (e.g. "Drrag" -> "Dragon").
+        // Returns the canonical tribe name, or null if nothing matches closely enough.
+        public static string MatchTribeName(string compName)
+        {
+            if (string.IsNullOrWhiteSpace(compName)) return null;
+            string normalized = NormalizeForTribeMatch(compName);
+            if (normalized.Length == 0) return null;
+            foreach (string tribe in TribeSlotOrder)
+                if (normalized.Equals(NormalizeForTribeMatch(tribe), StringComparison.Ordinal)) return tribe;
+            string deduped = DedupeConsecutiveLetters(normalized);
+            foreach (string tribe in TribeSlotOrder)
+            {
+                string tribeNorm = NormalizeForTribeMatch(tribe);
+                if (tribeNorm.Length < 4 || deduped.Length < 4) continue;
+                if (tribeNorm.StartsWith(deduped, StringComparison.Ordinal) || deduped.StartsWith(tribeNorm, StringComparison.Ordinal))
+                    return tribe;
+            }
+            return null;
+        }
+
+        public static int GetTribeSlotIndex(string tribe)
+        {
+            if (string.IsNullOrWhiteSpace(tribe)) return -1;
+            for (int i = 0; i < TribeSlotOrder.Length; i++)
+                if (string.Equals(TribeSlotOrder[i], tribe, StringComparison.OrdinalIgnoreCase)) return i;
+            return -1;
+        }
+
+        private static string NormalizeForTribeMatch(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (char c in s.Trim())
+            {
+                char up = char.ToUpperInvariant(StripAccent(c));
+                if (char.IsLetter(up)) sb.Append(up);
+            }
+            return sb.ToString();
+        }
+
+        private static char StripAccent(char c)
+        {
+            switch (c)
+            {
+                case 'à': case 'â': case 'ä': case 'á': case 'À': case 'Â': case 'Ä': case 'Á': return 'a';
+                case 'é': case 'è': case 'ê': case 'ë': case 'É': case 'È': case 'Ê': case 'Ë': return 'e';
+                case 'î': case 'ï': case 'í': case 'ì': case 'Î': case 'Ï': case 'Í': case 'Ì': return 'i';
+                case 'ô': case 'ö': case 'ó': case 'ò': case 'Ô': case 'Ö': case 'Ó': case 'Ò': return 'o';
+                case 'ù': case 'û': case 'ü': case 'ú': case 'Ù': case 'Û': case 'Ü': case 'Ú': return 'u';
+                case 'ç': case 'Ç': return 'c';
+                case 'ñ': case 'Ñ': return 'n';
+                default: return c;
+            }
+        }
+
+        private static string DedupeConsecutiveLetters(string s)
+        {
+            var sb = new StringBuilder();
+            char prev = '\0';
+            foreach (char c in s)
+            {
+                if (c != prev) sb.Append(c);
+                prev = c;
+            }
+            return sb.ToString();
         }
 
         private static IEnumerable<string> SafeReadLines(string path)
@@ -494,7 +663,9 @@ namespace HDTShopWishlist
 
         public bool DeleteComp(int index)
         {
-            if (index < 0 || index >= _compCount || _compCount <= 3) return false;
+            // The 10 tribe slots are permanent - only a custom comp (index >= TribeSlotCount) can
+            // be deleted.
+            if (index < TribeSlotCount || index >= _compCount) return false;
             string path = _compPaths[index];
             try { if (File.Exists(path)) File.Delete(path); } catch { }
             for (int i=index; i<_compCount-1; i++)
@@ -543,7 +714,9 @@ namespace HDTShopWishlist
 
         public void RenameComp(int index, string requestedName)
         {
-            if (index < 0 || index >= _compCount || string.IsNullOrWhiteSpace(requestedName)) return;
+            // Tribe slots keep their fixed name (see Load()'s invariant re-apply) - only a
+            // custom comp can be renamed.
+            if (index < TribeSlotCount || index >= _compCount || string.IsNullOrWhiteSpace(requestedName)) return;
             _compNames[index] = requestedName.Trim();
             try { File.WriteAllText(IOPath.Combine(_dir, "comp-name-" + (index + 1) + ".txt"), _compNames[index]); } catch { }
         }
@@ -616,6 +789,18 @@ namespace HDTShopWishlist
         private (int left,int top,int width,int height) _stableRect;
         private bool _hasStableRect;
 
+        // Temporary diagnostic for a reported "no highlight at all" regression: throttled so it
+        // costs nothing at 10Hz, but captures enough per shop tick to tell whether the wishlist
+        // targeting genuinely disappeared upstream (pinningVm/ShopCards empty) or downstream (shop
+        // cards seen, but none match the active comp). Remove once the cause is confirmed.
+        private DateTime _lastHighlightLog = DateTime.MinValue;
+        private static readonly string HighlightDebugLogPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_highlight_debug.log");
+        private static void HighlightDebugLog(string line)
+        {
+            try { File.AppendAllText(HighlightDebugLogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + line + Environment.NewLine); }
+            catch { }
+        }
+
         // Calibration aid (Ctrl+Shift+G): draws every shop slot's computed box, not just the
         // highlighted one, with its index - so a single screenshot shows the whole row's
         // alignment at once instead of needing one lucky screenshot per slot.
@@ -681,7 +866,21 @@ namespace HDTShopWishlist
 
         public void UpdateFromGame(object game)
         {
-            if (game == null || !PluginReflection.GetBool(game, "IsBattlegroundsMatch"))
+            bool bgMatch = game != null && PluginReflection.GetBool(game, "IsBattlegroundsMatch");
+            bool combatPhase = bgMatch && PluginReflection.GetBool(game, "IsBattlegroundsCombatPhase");
+
+            // Same diagnostic as the shop-tick log below, but covers the early-return gates too -
+            // if IsBattlegroundsCombatPhase ever reports stuck-true during an actual shop (a HDT-
+            // side state bug, plausible after an HDT auto-update), the code below never runs and the
+            // later log point never fires. This one always does, every 2s regardless of branch.
+            if ((DateTime.UtcNow - _lastHighlightLog).TotalSeconds >= 2)
+            {
+                _lastHighlightLog = DateTime.UtcNow;
+                HighlightDebugLog("gate bgMatch=" + bgMatch + " combatPhase=" + combatPhase
+                    + " foreground=" + Native.IsForegroundHearthstone());
+            }
+
+            if (!bgMatch)
             {
                 HideAll();
                 return;
@@ -689,7 +888,7 @@ namespace HDTShopWishlist
             // The shop-slot geometry in BuildSlots only means anything while the shop is open.
             // During combat the same screen area shows the fight board instead, so a stale/leftover
             // highlight box would land on whatever minion happens to occupy that position.
-            if (PluginReflection.GetBool(game, "IsBattlegroundsCombatPhase"))
+            if (combatPhase)
             {
                 HideAll();
                 return;
@@ -733,6 +932,21 @@ namespace HDTShopWishlist
             PlaceOver(rect.left, rect.top, rect.width, rect.height);
 
             List<string> live = shopCardIds.Take(MaxSlots).ToList();
+
+            if ((DateTime.UtcNow - _lastHighlightLog).TotalSeconds >= 2)
+            {
+                _lastHighlightLog = DateTime.UtcNow;
+                var activeIds = _store.ActiveIds.ToList();
+                int matches = live.Count(id => activeIds.Contains(id.Trim(), StringComparer.OrdinalIgnoreCase));
+                HighlightDebugLog("pinningVmNull=" + (pinningVm == null)
+                    + " shopCardsRaw=" + (pinningVm != null && pinningVm.ShopCards != null ? pinningVm.ShopCards.Count.ToString() : "n/a")
+                    + " liveOccupied=" + live.Count
+                    + " liveIds=[" + string.Join(",", live) + "]"
+                    + " activeComp=" + _store.ActiveCompIndex + " (" + _store.GetCompName(_store.ActiveCompIndex) + ")"
+                    + " activeIdsCount=" + activeIds.Count
+                    + " matches=" + matches);
+            }
+
             if (live.Count == 0)
             {
                 HideAll();
@@ -1239,6 +1453,9 @@ namespace HDTShopWishlist
                     Native.RegisterHotKey(h, 1341, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.M));
                     // Investigation aid: dump TB_BaconShop's field names/types to a log file.
                     Native.RegisterHotKey(h, 1342, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.F));
+                    // Investigation aid: dump the leaderboard portrait card classes' fields, looking
+                    // for whatever drives the native "who I'm fighting this round" red highlight.
+                    Native.RegisterHotKey(h, 1343, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.O));
                 }
                 HwndSource src = HwndSource.FromHwnd(h);
                 if (src != null) src.AddHook(WndProc);
@@ -1253,6 +1470,7 @@ namespace HDTShopWishlist
             try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1340); } catch { }
             try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1341); } catch { }
             try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1342); } catch { }
+            try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1343); } catch { }
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -1284,6 +1502,25 @@ namespace HDTShopWishlist
                 handled = true;
                 string logPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_fields.log");
                 Task.Run(delegate { BattlegroundsScryMemory.Instance.DumpClassFieldNamesToFile(logPath, "TB_BaconShop"); });
+            }
+            else if (msg == Native.WM_HOTKEY && wParam.ToInt32() == 1343)
+            {
+                handled = true;
+                string fieldsPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_opponent_fields.log");
+                string scanPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_leaderboard_classscan.log");
+                string valuesPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_opponent_values.log");
+                Task.Run(delegate
+                {
+                    // The exact guessed class names (best-effort) plus a broad name scan for
+                    // "Leaderboard" - if the guesses are wrong, the scan still gives the real
+                    // class name(s) to dump fields for on a follow-up press.
+                    BattlegroundsScryMemory.Instance.DumpClassFieldNamesToFile(fieldsPath,
+                        "PlayerLeaderboardCard", "PlayerLeaderboardTeam", "PlayerLeaderboardManager", "PlayerLeaderboardCardOverlay");
+                    BattlegroundsScryMemory.Instance.DumpMatchingClassesToFile(scanPath, "Leaderboard", "Opponent", "Portrait");
+                    // The live runtime value right now, per seat - confirms whether the field is
+                    // genuinely false at this moment (wrong phase/timing) or a read bug.
+                    BattlegroundsScryMemory.Instance.DumpLeaderboardTilesToFile(valuesPath);
+                });
             }
             return IntPtr.Zero;
         }
@@ -1582,6 +1819,12 @@ namespace HDTShopWishlist
             MouseLeftButtonDown += LauncherMouseDown;
             MouseMove += LauncherMouseMove;
             MouseLeftButtonUp += LauncherMouseUp;
+            // If Windows revokes capture mid-drag, MouseUp never fires here, so without this
+            // _dragging stays stuck true forever. While stuck, the window still holds mouse
+            // capture, so every left-button drag anywhere in the game (repositioning a board
+            // minion, dragging a card) gets routed to LauncherMouseMove and yanks the icon to
+            // wherever that unrelated drag ends - the reported "icon jumps around randomly".
+            LostMouseCapture += delegate { _dragging = false; _dragMoved = false; };
         }
 
         private UIElement BuildContent()
@@ -1678,12 +1921,12 @@ namespace HDTShopWishlist
 
         private void LauncherMouseDown(object sender, MouseButtonEventArgs e)
         {
+            if (!CaptureMouse()) return;
             _dragging = true;
             _dragMoved = false;
             _dragStartScreen = PointToScreen(e.GetPosition(this));
             _dragStartLeft = Left;
             _dragStartTop = Top;
-            CaptureMouse();
             e.Handled = true;
         }
 
@@ -1764,6 +2007,7 @@ namespace HDTShopWishlist
             public int DuoTeammatePlayerId;
             public bool DuoFightsFirstKnown;
             public bool DuoFightsFirst;
+            public bool IsNextOpponent;
         }
 
         private sealed class HeroRuntimeState
@@ -1781,12 +2025,18 @@ namespace HDTShopWishlist
             public bool DuoFightsFirstKnown;
             public bool DuoFightsFirst;
             public int LeaderboardPlace;
+            public int NextOpponentPlayerId;
+            public int NextOpponentTeammatePlayerId;
         }
 
         // PLAYER_TECH_LEVEL and the Duo/leaderboard tags live on the TYPE_PLAYER entity, not on the
         // hero minion entity. Reading them only from hero-like entities (as before) left these fields
         // at 0 for every non-local player, which silently forced the rail to fall back to the
         // hover-only native "recent combats" panel for tier. See RefreshHeroRuntimeCacheIfNeeded.
+        // NEXT_OPPONENT_PLAYER_ID / _TEAMMATE_PLAYER_ID (who the LOCAL player is about to fight)
+        // live here too - confirmed by the same reasoning after m_isNextOpponent (a native
+        // leaderboard-widget UI flag) and a first attempt reading these two tags off the hero
+        // minion entity both stayed at 0 across full live games.
         private sealed class PlayerTagState
         {
             public int TavernTier;
@@ -1796,6 +2046,8 @@ namespace HDTShopWishlist
             public bool DuoFightsFirstKnown;
             public bool DuoFightsFirst;
             public int LeaderboardPlace;
+            public int NextOpponentPlayerId;
+            public int NextOpponentTeammatePlayerId;
         }
 
         private readonly StackPanel _panel = new StackPanel();
@@ -1854,8 +2106,33 @@ namespace HDTShopWishlist
         private DateTime _lastDuoOrderRefresh = DateTime.MinValue;
         private readonly int[] _duoVisualToNativeSeat = Enumerable.Range(0, MaxRows).ToArray();
 
-        public BattlegroundsLobbyInfoWindow()
+        // Auto-switch: once the local player's own board reaches 4+ of one tribe (the same
+        // native "dominant tribe + count" the leaderboard already shows for every seat), make
+        // that tribe's comp the active one so shop highlighting follows what they are building.
+        private readonly WishlistStore _store;
+        private string _lastAutoSwitchTribe;
+        private const int AutoSwitchTribeCountThreshold = 4;
+
+        // Who the local player is about to fight, from HearthDb.Enums.GameTag.NEXT_OPPONENT_PLAYER_ID
+        // / _TEAMMATE_PLAYER_ID on their own hero entity - real game-state tags, not the dead-end
+        // m_isNextOpponent UI/animation flag (confirmed always False across full Duos and Solo games).
+        // Updated whenever self's own seat is (re)polled; compared against every other seat's
+        // PlayerId to flag the row(s) red.
+        private int _selfNextOpponentPlayerId;
+        private int _selfNextOpponentTeammatePlayerId;
+
+        // Temporary diagnostic for the opponent-highlight investigation - remove once resolved.
+        private static readonly string OpponentDiagLogPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_opponent_live.log");
+        private DateTime _lastOpponentHeartbeat = DateTime.MinValue;
+        private static void OpponentDiagLog(string line)
         {
+            try { File.AppendAllText(OpponentDiagLogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + line + Environment.NewLine); }
+            catch { }
+        }
+
+        public BattlegroundsLobbyInfoWindow(WishlistStore store)
+        {
+            _store = store;
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
@@ -1874,6 +2151,13 @@ namespace HDTShopWishlist
             MouseLeftButtonDown += HandleMouseDown;
             MouseMove += HandleMouseMove;
             MouseLeftButtonUp += HandleMouseUp;
+            // If Windows revokes capture mid-drag (game regains focus, mouse leaves the panel
+            // during a fast/involuntary nudge, etc.) MouseUp never fires on this window, so
+            // without this handler _dragging stays stuck true forever. While stuck, every click
+            // anywhere on the panel - including the Skip Combat button - is swallowed by the drag
+            // logic instead of reaching the button, which is what made it look like the button
+            // needed several clicks before one "took".
+            LostMouseCapture += delegate { _dragging = false; };
             var skipCombatButton = new Border
             {
                 Width = PanelWidth - 2,
@@ -1934,6 +2218,14 @@ namespace HDTShopWishlist
                 HideAll();
                 Hide();
                 return;
+            }
+
+            if ((DateTime.UtcNow - _lastOpponentHeartbeat).TotalSeconds >= 5)
+            {
+                _lastOpponentHeartbeat = DateTime.UtcNow;
+                OpponentDiagLog("heartbeat selfNextOpp=" + _selfNextOpponentPlayerId + " mate=" + _selfNextOpponentTeammatePlayerId + "  "
+                    + string.Join(" | ", _cachedSnapshot.Select(x =>
+                    x.PortraitOrder + ":" + (x.CardId ?? "?") + " pid=" + x.PlayerId + (x.IsSelf ? "(self)" : "") + " opp=" + x.IsNextOpponent)));
             }
 
             Rect rect;
@@ -2232,6 +2524,26 @@ namespace HDTShopWishlist
 
             info.PortraitOrder = seatIndex + 1;
             info.IsSelf = isSelf;
+            if (isSelf && runtime != null)
+            {
+                // NEXT_OPPONENT_PLAYER_ID lives on the TYPE_PLAYER entity (same place as
+                // PLAYER_TECH_LEVEL / the Duo tags - see RefreshHeroRuntimeCacheIfNeeded), not on
+                // the hero minion entity `tile` reads from a different (native Mono) path - a
+                // first attempt reading it off `tile`'s hero entity stayed at 0 all game.
+                // Only overwrite with a genuine reading - a transient 0 (e.g. mid-shop, before
+                // pairing is decided for the next round) should not clobber the last known pairing.
+                if (runtime.NextOpponentPlayerId > 0) _selfNextOpponentPlayerId = runtime.NextOpponentPlayerId;
+                if (runtime.NextOpponentTeammatePlayerId > 0) _selfNextOpponentTeammatePlayerId = runtime.NextOpponentTeammatePlayerId;
+            }
+            bool wasNextOpponent = info.IsNextOpponent;
+            info.IsNextOpponent = !isSelf && info.PlayerId > 0 &&
+                (info.PlayerId == _selfNextOpponentPlayerId || info.PlayerId == _selfNextOpponentTeammatePlayerId);
+            // Temporary diagnostic - catch the edge automatically instead of guessing from a
+            // manually-timed hotkey press.
+            if (info.IsNextOpponent && !wasNextOpponent)
+                OpponentDiagLog("EDGE seat=" + seatIndex + " hero=" + tile.HeroCardId + " playerId=" + info.PlayerId
+                    + " -> IsNextOpponent=True (selfNextOpp=" + _selfNextOpponentPlayerId + " mate=" + _selfNextOpponentTeammatePlayerId + ")");
+            if (isSelf) MaybeAutoSwitchComp(info.Tribe, info.TribeCount);
 
             if (!isSelf && runtime != null && runtime.HasHealthData && runtime.CurrentHealth <= 0)
             {
@@ -2243,6 +2555,24 @@ namespace HDTShopWishlist
             {
                 info.IsDead = false;
             }
+        }
+
+        // Fires once per fresh threshold-cross, not on every poll of the same tribe - re-arms
+        // when the count drops back below the threshold (minion sold/died) or a different tribe
+        // takes over, so a pivot mid-game switches the active comp again.
+        private void MaybeAutoSwitchComp(string tribe, int tribeCount)
+        {
+            if (_store == null) return;
+            if (tribeCount < AutoSwitchTribeCountThreshold)
+            {
+                _lastAutoSwitchTribe = null;
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(tribe) || string.Equals(_lastAutoSwitchTribe, tribe, StringComparison.OrdinalIgnoreCase)) return;
+            int slot = WishlistStore.GetTribeSlotIndex(tribe);
+            if (slot < 0) return;
+            _lastAutoSwitchTribe = tribe;
+            if (_store.ActiveCompIndex != slot) _store.SetActiveComp(slot);
         }
 
         private static string BuildHeroIdentityKey(BattlegroundsScryMemory.RailTile tile, LobbyHeroInfo info, int seatIndex)
@@ -2327,7 +2657,9 @@ namespace HDTShopWishlist
                         DuoTeammatePlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "BACON_DUO_TEAMMATE_PLAYER_ID", "DUO_TEAMMATE_PLAYER_ID" }),
                         DuoFightsFirstKnown = fightsFirstKnownP,
                         DuoFightsFirst = PluginReflection.GetTagValueByNames(entity, new[] { "BACON_DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT", "DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT" }) > 0,
-                        LeaderboardPlace = PluginReflection.GetTagValueByNames(entity, new[] { "PLAYER_LEADERBOARD_PLACE", "LEADERBOARD_PLACE" })
+                        LeaderboardPlace = PluginReflection.GetTagValueByNames(entity, new[] { "PLAYER_LEADERBOARD_PLACE", "LEADERBOARD_PLACE" }),
+                        NextOpponentPlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "NEXT_OPPONENT_PLAYER_ID" }),
+                        NextOpponentTeammatePlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "NEXT_OPPONENT_TEAMMATE_PLAYER_ID" })
                     };
                 }
 
@@ -2356,6 +2688,7 @@ namespace HDTShopWishlist
                     bool hasFightsFirstTag = PluginReflection.HasTag(entity, "BACON_DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT") || PluginReflection.HasTag(entity, "DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT");
                     int fightsFirstRaw = PluginReflection.GetTagValueByNames(entity, new[] { "BACON_DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT", "DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT" });
 
+                    int nextOpponentPlayerId = 0, nextOpponentTeammatePlayerId = 0;
                     PlayerTagState playerTags;
                     if (playerId > 0 && playerTagsById.TryGetValue(playerId, out playerTags))
                     {
@@ -2364,9 +2697,11 @@ namespace HDTShopWishlist
                         if (playerTags.DuoTeammatePlayerId > 0) duoMate = playerTags.DuoTeammatePlayerId;
                         if (playerTags.DuoFightsFirstKnown) { hasFightsFirstTag = true; fightsFirstRaw = playerTags.DuoFightsFirst ? 1 : 0; }
                         if (playerTags.LeaderboardPlace > 0) leaderboardPlace = playerTags.LeaderboardPlace;
+                        nextOpponentPlayerId = playerTags.NextOpponentPlayerId;
+                        nextOpponentTeammatePlayerId = playerTags.NextOpponentTeammatePlayerId;
                     }
 
-                    _heroRuntimeCache.Add(new HeroRuntimeState { PlayerId = playerId, EntityId = entityId, CardId = card, CurrentHealth = currentHealth, HasHealthData = hasHealthData, IsHeroInPlay = PluginReflection.GetBool(entity, "IsInPlay"), TavernTier = heroTier, DuoTeam = duoTeam, DuoTeamKnown = duoTeamKnown, DuoTeammatePlayerId = duoMate, DuoFightsFirstKnown = hasFightsFirstTag, DuoFightsFirst = fightsFirstRaw > 0, LeaderboardPlace = leaderboardPlace });
+                    _heroRuntimeCache.Add(new HeroRuntimeState { PlayerId = playerId, EntityId = entityId, CardId = card, CurrentHealth = currentHealth, HasHealthData = hasHealthData, IsHeroInPlay = PluginReflection.GetBool(entity, "IsInPlay"), TavernTier = heroTier, DuoTeam = duoTeam, DuoTeamKnown = duoTeamKnown, DuoTeammatePlayerId = duoMate, DuoFightsFirstKnown = hasFightsFirstTag, DuoFightsFirst = fightsFirstRaw > 0, LeaderboardPlace = leaderboardPlace, NextOpponentPlayerId = nextOpponentPlayerId, NextOpponentTeammatePlayerId = nextOpponentTeammatePlayerId });
                 }
             }
             catch { }
@@ -2620,7 +2955,7 @@ namespace HDTShopWishlist
         private string BuildRenderSignature(List<LobbyHeroInfo> infos, double rowHeight)
         {
             string core = string.Join("|", infos.Select(x => string.Join(":", x.Id, x.Health, x.TavernTier,
-                NormalizeLobbyTribe(x.Tribe), x.TribeCount, x.PortraitOrder, x.LevelUpPending, x.PlayerId, x.DuoTeammatePlayerId, x.DuoFightsFirst )));
+                NormalizeLobbyTribe(x.Tribe), x.TribeCount, x.PortraitOrder, x.LevelUpPending, x.PlayerId, x.DuoTeammatePlayerId, x.DuoFightsFirst, x.IsNextOpponent )));
             return rowHeight.ToString("0.##") + ";" + core;
         }
 
@@ -2633,8 +2968,10 @@ namespace HDTShopWishlist
                     ? infos[i]
                     : new LobbyHeroInfo { PortraitOrder = i + 1, IsUnresolved = true };
                 row.Height = rowHeight;
-                row.BorderBrush = new SolidColorBrush(info.IsSelf ? Color.FromRgb(0, 235, 210) : Color.FromArgb(170, 150, 95, 220));
-                row.BorderThickness = new Thickness(info.IsSelf ? 2 : 1);
+                row.BorderBrush = new SolidColorBrush(info.IsSelf ? Color.FromRgb(0, 235, 210)
+                    : info.IsNextOpponent ? Color.FromRgb(255, 70, 70)
+                    : Color.FromArgb(170, 150, 95, 220));
+                row.BorderThickness = new Thickness(info.IsSelf || info.IsNextOpponent ? 2 : 1);
                 row.Child = BuildRow(info);
                 row.Visibility = Visibility.Visible;
             }
@@ -2673,8 +3010,12 @@ namespace HDTShopWishlist
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            Color accent = info.IsSelf ? Color.FromRgb(0, 235, 210) : Color.FromRgb(195, 120, 255);
-            Color bg = info.IsSelf ? Color.FromArgb(220, 8, 52, 48) : Color.FromArgb(220, 42, 22, 68);
+            Color accent = info.IsSelf ? Color.FromRgb(0, 235, 210)
+                : info.IsNextOpponent ? Color.FromRgb(255, 70, 70)
+                : Color.FromRgb(195, 120, 255);
+            Color bg = info.IsSelf ? Color.FromArgb(220, 8, 52, 48)
+                : info.IsNextOpponent ? Color.FromArgb(220, 58, 14, 14)
+                : Color.FromArgb(220, 42, 22, 68);
             var tier = new Border
             {
                 Width = 30,
@@ -2682,7 +3023,7 @@ namespace HDTShopWishlist
                 CornerRadius = new CornerRadius(5),
                 Background = new SolidColorBrush(bg),
                 BorderBrush = new SolidColorBrush(accent),
-                BorderThickness = new Thickness(info.IsSelf ? 2 : 1),
+                BorderThickness = new Thickness(info.IsSelf || info.IsNextOpponent ? 2 : 1),
                 VerticalAlignment = VerticalAlignment.Center
             };
             tier.Child = new TextBlock
@@ -2724,6 +3065,7 @@ namespace HDTShopWishlist
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
                     ToolTip = info.IsSelf ? "You • " + tribe + (count > 0 ? " ×" + count.ToString() : string.Empty) :
+                        (info.IsNextOpponent ? "Fighting this round • " : string.Empty) +
                         (info.TavernTier > 0 ? "Tavern Tier " + info.TavernTier + " • " + tribe + (count > 0 ? " ×" + count.ToString() : string.Empty) : tribe)
                 };
                 Grid.SetColumn(iconImage, 1);
@@ -3271,11 +3613,11 @@ namespace HDTShopWishlist
         private void HandleMouseDown(object sender, MouseButtonEventArgs e)
         {
             if (e.ChangedButton != MouseButton.Left) return;
+            if (!CaptureMouse()) return;
             _dragging = true;
             _dragStartScreen = PointToScreen(e.GetPosition(this));
             _dragStartLeft = Left;
             _dragStartTop = Top;
-            CaptureMouse();
             e.Handled = true;
         }
 
@@ -3634,41 +3976,126 @@ namespace HDTShopWishlist
             if(_compTabsPanel==null)return;
             _compTabsPanel.Children.Clear();
             for(int i=0;i<_compTabs.Length;i++)_compTabs[i]=null;
-            for(int i=0;i<_store.CompCount;i++)
+            bool first=true;
+            // Tribe tabs render in _tribeOrder - the same user-draggable order already used for
+            // the card-selector tribe filter row, so both stay in sync.
+            foreach(string tribeName in _tribeOrder)
             {
-                int captured=i;
-                var holder=new StackPanel{Orientation=Orientation.Horizontal,VerticalAlignment=VerticalAlignment.Center,Margin=new Thickness(i==0?0:5,0,0,0)};
-                var b=new Button{Content=_store.GetCompName(i)+(i==_store.ActiveCompIndex?"  ✓":""),Padding=new Thickness(14,8,14,8),MinWidth=64,FontSize=13,Background=new SolidColorBrush(Color.FromRgb(55,38,76)),Foreground=Brushes.White,ToolTip="Left click: edit • Double click: rename • Right click: menu"};
-                b.Click+=delegate{SwitchComp(captured);};
-                b.MouseDoubleClick+=delegate{
-                    if(captured>=0 && captured<_store.CompCount)
-                    {
-                        SaveCurrent(false);
-                        _store.SetActiveComp(captured);
-                        _editingComp=captured;
-                        RefreshSelected();
-                        UpdateTabs();
-                        SetStatus(_store.GetCompName(captured)+" is now active in-game.");
-                    }
-                };
-                var menu=new ContextMenu();
-                var rename=new MenuItem{Header="Rename"}; rename.Click+=delegate{RenameComp(captured);}; menu.Items.Add(rename);
-                var activate=new MenuItem{Header="Set active in game"}; activate.Click+=delegate{_store.SetActiveComp(captured);UpdateTabs();SetStatus(_store.GetCompName(captured)+" is now active in-game.");}; menu.Items.Add(activate);
-                var duplicate=new MenuItem{Header="Duplicate comp"}; duplicate.Click+=delegate{ DuplicateComp(captured); }; menu.Items.Add(duplicate);
-                var deleteMenu=new MenuItem{Header="Delete comp",IsEnabled=captured!=_store.ActiveCompIndex && _store.CompCount>1}; deleteMenu.Click+=delegate{ DeleteComp(captured); }; menu.Items.Add(deleteMenu);
-                b.ContextMenu=menu;
-                _compTabs[captured]=b;
-                holder.Children.Add(b);
-                if(captured!=_store.ActiveCompIndex && _store.CompCount>1)
-                {
-                    var trash=CreateCompactorButton();
-                    trash.Click+=delegate{DeleteCompWithConfirm(captured);};
-                    holder.Children.Add(trash);
-                }
-                _compTabsPanel.Children.Add(holder);
+                int idx=WishlistStore.GetTribeSlotIndex(tribeName);
+                if(idx<0||idx>=_store.CompCount) continue;
+                BuildOneCompTab(idx,first); first=false;
             }
+            for(int i=WishlistStore.TribeSlotCount;i<_store.CompCount;i++){ BuildOneCompTab(i,first); first=false; }
             UpdateTabs();
-            if(_addCompButton!=null){_addCompButton.IsEnabled=_store.CompCount<WishlistStore.MaxComps;_addCompButton.ToolTip=_store.CompCount<WishlistStore.MaxComps?"Add a new comp":"Maximum comps reached";}
+            if(_addCompButton!=null){_addCompButton.IsEnabled=_store.CompCount<WishlistStore.MaxComps;_addCompButton.ToolTip=_store.CompCount<WishlistStore.MaxComps?"Add a new custom comp":"Maximum comps reached";}
+        }
+
+        private void BuildOneCompTab(int captured, bool isFirst)
+        {
+            bool isTribeSlot=captured<WishlistStore.TribeSlotCount;
+            bool active=captured==_store.ActiveCompIndex;
+            string name=_store.GetCompName(captured);
+            var holder=new StackPanel{Orientation=Orientation.Horizontal,VerticalAlignment=VerticalAlignment.Center,Margin=new Thickness(isFirst?0:(isTribeSlot?7:5),0,0,0)};
+            Button b;
+            if(isTribeSlot)
+            {
+                ImageSource icon=GetTribeIcon(name);
+                b=new Button{Padding=new Thickness(6),Width=44,Height=44,Background=new SolidColorBrush(active?Color.FromRgb(98,54,140):Color.FromRgb(40,28,56)),BorderBrush=new SolidColorBrush(active?Color.FromRgb(214,125,255):Color.FromRgb(90,66,112)),BorderThickness=new Thickness(active?2:1),ToolTip=name+(active?" (active in-game)":string.Empty)+" • Left click: edit • Drag: reorder • Right click: menu"};
+                if(icon!=null) b.Content=new Image{Source=icon,Stretch=Stretch.Uniform,Width=28,Height=28};
+                else b.Content=new TextBlock{Text=name,FontSize=10,FontWeight=FontWeights.Bold,Foreground=Brushes.White,TextAlignment=TextAlignment.Center,TextWrapping=TextWrapping.Wrap};
+            }
+            else
+            {
+                b=new Button{Content=name+(active?"  ✓":string.Empty),Padding=new Thickness(14,8,14,8),MinWidth=64,FontSize=13,Background=new SolidColorBrush(Color.FromRgb(55,38,76)),Foreground=Brushes.White,ToolTip="Left click: edit • Double click: rename • Right click: menu"};
+            }
+            b.Click+=delegate{SwitchComp(captured);};
+            b.MouseDoubleClick+=delegate{
+                if(captured>=0 && captured<_store.CompCount)
+                {
+                    SaveCurrent(false);
+                    _store.SetActiveComp(captured);
+                    _editingComp=captured;
+                    RefreshSelected();
+                    UpdateTabs();
+                    SetStatus(_store.GetCompName(captured)+" is now active in-game.");
+                }
+            };
+            var menu=new ContextMenu();
+            if(!isTribeSlot)
+            {
+                var rename=new MenuItem{Header="Rename"}; rename.Click+=delegate{RenameComp(captured);}; menu.Items.Add(rename);
+            }
+            var activate=new MenuItem{Header="Set active in game"}; activate.Click+=delegate{_store.SetActiveComp(captured);UpdateTabs();SetStatus(_store.GetCompName(captured)+" is now active in-game.");}; menu.Items.Add(activate);
+            var duplicate=new MenuItem{Header="Duplicate comp"}; duplicate.Click+=delegate{ DuplicateComp(captured); }; menu.Items.Add(duplicate);
+            if(!isTribeSlot)
+            {
+                var deleteMenu=new MenuItem{Header="Delete comp",IsEnabled=captured!=_store.ActiveCompIndex && _store.CompCount>1}; deleteMenu.Click+=delegate{ DeleteComp(captured); }; menu.Items.Add(deleteMenu);
+            }
+            b.ContextMenu=menu;
+            _compTabs[captured]=b;
+            holder.Children.Add(b);
+            if(isTribeSlot) AttachCompTribeDrag(b,name);
+            if(!isTribeSlot && captured!=_store.ActiveCompIndex && _store.CompCount>1)
+            {
+                var trash=CreateCompactorButton();
+                trash.Click+=delegate{DeleteCompWithConfirm(captured);};
+                holder.Children.Add(trash);
+            }
+            _compTabsPanel.Children.Add(holder);
+        }
+
+        private Button _draggedCompTribeButton; private Point _compTribeDragStart; private bool _draggingCompTribe;
+
+        // Mirrors AttachTribeDrag/ReorderTribeAt (the card-selector filter row's existing
+        // drag-to-reorder) but operating on the comp tab row, against the same _tribeOrder list -
+        // dragging either row keeps both in sync.
+        private void AttachCompTribeDrag(Button button, string tribe)
+        {
+            button.PreviewMouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e)
+            {
+                _draggedCompTribeButton = button; _compTribeDragStart = e.GetPosition(_compTabsPanel); _draggingCompTribe = false;
+            };
+            button.PreviewMouseMove += delegate(object sender, MouseEventArgs e)
+            {
+                if(_draggedCompTribeButton!=button || e.LeftButton!=MouseButtonState.Pressed) return;
+                Point p=e.GetPosition(_compTabsPanel);
+                if(!_draggingCompTribe && Math.Abs(p.X-_compTribeDragStart.X)>6)
+                {
+                    _draggingCompTribe=true;
+                    button.CaptureMouse();
+                    button.Opacity=0.72;
+                    button.RenderTransform=new TranslateTransform(0,-5);
+                }
+            };
+            button.PreviewMouseLeftButtonUp += delegate(object sender, MouseButtonEventArgs e)
+            {
+                if(_draggedCompTribeButton!=button) return;
+                if(_draggingCompTribe)
+                {
+                    button.ReleaseMouseCapture(); button.Opacity=1; button.RenderTransform=null;
+                    e.Handled=true; ReorderCompTribeAt(tribe, e.GetPosition(_compTabsPanel).X);
+                }
+                _draggedCompTribeButton=null; _draggingCompTribe=false;
+            };
+        }
+
+        private void ReorderCompTribeAt(string tribe, double x)
+        {
+            _tribeOrder.Remove(tribe);
+            int insertIndex=_tribeOrder.Count;
+            for(int i=0;i<_tribeOrder.Count;i++)
+            {
+                int idx=WishlistStore.GetTribeSlotIndex(_tribeOrder[i]);
+                Button b=idx>=0 && idx<_compTabs.Length?_compTabs[idx]:null;
+                if(b==null) continue;
+                Point center=b.TranslatePoint(new Point(b.ActualWidth/2,0),_compTabsPanel);
+                if(x<center.X){insertIndex=i;break;}
+            }
+            _tribeOrder.Insert(insertIndex,tribe);
+            _store.SaveTribeOrder(_tribeOrder);
+            BuildCompTabs();
+            RebuildTribeRow();
+            SetStatus("Tribe order saved.");
         }
 
         private Button CreateCompactorButton()
@@ -4260,52 +4687,81 @@ namespace HDTShopWishlist
             for(int i=startIndex;i<end;i++)
             {
                 CardDescriptor c=cards[i];
+                bool isSelected=selectedIds.Contains(c.Id);
                 var b=new Button
                 {
-                    Width=104, Height=108, Margin=new Thickness(2), Padding=new Thickness(0),
+                    Width=118, Height=122, Margin=new Thickness(2), Padding=new Thickness(0),
                     Background=Brushes.Transparent, Foreground=Brushes.White, BorderBrush=Brushes.Transparent,
                     BorderThickness=new Thickness(0), Cursor=Cursors.Hand, IsHitTestVisible=true,
-                    ToolTip=c.Name+"\\n"+c.Category+"\\n"+c.TribeLabel+"\\nTier "+(c.Tier>0?c.Tier.ToString():"?")
+                    ToolTip=c.Name+"\\n"+c.Category+"\\n"+c.TribeLabel+"\\nTier "+(c.Tier>0?c.Tier.ToString():"?")+
+                        (isSelected?"\\nLeft click: change priority • Right click: remove":"\\nLeft click: add as Core")
                 };
 
                 var artBorder=new Border
                 {
-                    Width=96, Height=96, Background=new SolidColorBrush(Color.FromRgb(16,12,22)),
-                    BorderBrush=selectedIds.Contains(c.Id)?new SolidColorBrush(Color.FromRgb(0,235,210)):new SolidColorBrush(Color.FromArgb(130,110,76,145)),
-                    BorderThickness=new Thickness(selectedIds.Contains(c.Id)?2:1), CornerRadius=new CornerRadius(7), ClipToBounds=true,
+                    Width=110, Height=110, Background=new SolidColorBrush(Color.FromRgb(16,12,22)),
+                    BorderBrush=isSelected?new SolidColorBrush(Color.FromRgb(0,235,210)):new SolidColorBrush(Color.FromArgb(130,110,76,145)),
+                    BorderThickness=new Thickness(isSelected?2:1), CornerRadius=new CornerRadius(8), ClipToBounds=true,
                     HorizontalAlignment=HorizontalAlignment.Center, VerticalAlignment=VerticalAlignment.Center, SnapsToDevicePixels=true
                 };
 
                 var art=new Image
                 {
-                    Source=GetBuilderArtOnlyImage(c), Width=96, Height=96, Stretch=Stretch.UniformToFill,
+                    Source=GetBuilderArtOnlyImage(c), Width=110, Height=110, Stretch=Stretch.UniformToFill,
                     HorizontalAlignment=HorizontalAlignment.Center, VerticalAlignment=VerticalAlignment.Center, SnapsToDevicePixels=true
                 };
                 RenderOptions.SetBitmapScalingMode(art, BitmapScalingMode.HighQuality);
 
                 var selectedBadge=new Border
                 {
-                    Width=24, Height=24, CornerRadius=new CornerRadius(12), Background=new SolidColorBrush(Color.FromRgb(8,38,36)),
+                    Width=26, Height=26, CornerRadius=new CornerRadius(13), Background=new SolidColorBrush(Color.FromRgb(8,38,36)),
                     BorderBrush=new SolidColorBrush(Color.FromRgb(0,235,210)), BorderThickness=new Thickness(2),
                     HorizontalAlignment=HorizontalAlignment.Right, VerticalAlignment=VerticalAlignment.Top, Margin=new Thickness(0,5,5,0),
-                    Visibility=selectedIds.Contains(c.Id)?Visibility.Visible:Visibility.Collapsed, IsHitTestVisible=false,
-                    Child=new TextBlock{Text="✓",Foreground=new SolidColorBrush(Color.FromRgb(165,255,240)),FontSize=15,FontWeight=FontWeights.Bold,
+                    Visibility=isSelected?Visibility.Visible:Visibility.Collapsed, IsHitTestVisible=false,
+                    Child=new TextBlock{Text="✓",Foreground=new SolidColorBrush(Color.FromRgb(165,255,240)),FontSize=16,FontWeight=FontWeights.Bold,
                         HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Center,TextAlignment=TextAlignment.Center}
                 };
-                var artCanvas=new Grid(); artCanvas.Children.Add(art); artCanvas.Children.Add(selectedBadge); artBorder.Child=artCanvas; b.Content=artBorder;
 
-                b.Click+=delegate{AddCard(c,1); RefreshLibrary();};
+                var artCanvas=new Grid(); artCanvas.Children.Add(art); artCanvas.Children.Add(selectedBadge);
+
+                // A bigger, clearer tribe badge (bottom-left) so the tribe reads at a glance
+                // instead of only in the tooltip. Skips neutral/no-tribe cards.
+                string primaryTribe=c.Tribes!=null && c.Tribes.Count>0 ? c.Tribes[0] : null;
+                ImageSource tribeIconSource=string.IsNullOrWhiteSpace(primaryTribe)?null:GetTribeIcon(primaryTribe);
+                if(tribeIconSource!=null)
+                {
+                    var tribeBadge=new Border
+                    {
+                        Width=32, Height=32, CornerRadius=new CornerRadius(16), Background=new SolidColorBrush(Color.FromArgb(215,18,12,28)),
+                        BorderBrush=new SolidColorBrush(Color.FromArgb(220,150,95,220)), BorderThickness=new Thickness(1.5),
+                        HorizontalAlignment=HorizontalAlignment.Left, VerticalAlignment=VerticalAlignment.Bottom, Margin=new Thickness(4,0,0,4),
+                        IsHitTestVisible=false,
+                        Child=new Image{Source=tribeIconSource,Width=24,Height=24,Stretch=Stretch.Uniform,SnapsToDevicePixels=true}
+                    };
+                    artCanvas.Children.Add(tribeBadge);
+                }
+
+                artBorder.Child=artCanvas; b.Content=artBorder;
+
+                b.Click+=delegate{
+                    if(isSelected) CyclePriority(c.Id); else AddCard(c,1);
+                    RefreshLibrary();
+                };
+                b.PreviewMouseRightButtonDown+=delegate(object sender, MouseButtonEventArgs e){
+                    if(isSelected){ RemoveCard(c.Id); RefreshLibrary(); }
+                    e.Handled=true;
+                };
                 b.MouseEnter+=delegate
                 {
                     artBorder.BorderBrush=new SolidColorBrush(Color.FromRgb(0,235,210));
-                    artBorder.BorderThickness=new Thickness(selectedIds.Contains(c.Id)?2:1);
+                    artBorder.BorderThickness=new Thickness(isSelected?2:1);
                     artBorder.Effect=new DropShadowEffect{Color=Color.FromRgb(0,235,210),BlurRadius=18,ShadowDepth=0,Opacity=0.58};
                     art.RenderTransformOrigin=new Point(0.5,0.5); art.RenderTransform=new ScaleTransform(1.045,1.045);
                 };
                 b.MouseLeave+=delegate
                 {
-                    artBorder.BorderBrush=selectedIds.Contains(c.Id)?new SolidColorBrush(Color.FromRgb(0,235,210)):new SolidColorBrush(Color.FromArgb(130,110,76,145));
-                    artBorder.BorderThickness=new Thickness(selectedIds.Contains(c.Id)?2:1); artBorder.Effect=null; art.RenderTransform=null;
+                    artBorder.BorderBrush=isSelected?new SolidColorBrush(Color.FromRgb(0,235,210)):new SolidColorBrush(Color.FromArgb(130,110,76,145));
+                    artBorder.BorderThickness=new Thickness(isSelected?2:1); artBorder.Effect=null; art.RenderTransform=null;
                 };
                 _library.Children.Add(b);
             }
@@ -4774,12 +5230,23 @@ namespace HDTShopWishlist
             {
                 Button b=_compTabs[i]; if(b==null)continue;
                 bool editing=i==_editingComp; bool active=i==_store.ActiveCompIndex;
+                string name=_store.GetCompName(i);
+                if(i<WishlistStore.TribeSlotCount)
+                {
+                    // Icon tabs signal editing/active purely through border/background - their
+                    // Content (icon or text fallback) never changes, so it is left untouched here.
+                    b.Background=new SolidColorBrush(editing?Color.FromRgb(98,54,140):(active?Color.FromRgb(98,54,140):Color.FromRgb(40,28,56)));
+                    b.BorderBrush=new SolidColorBrush(active?Color.FromRgb(40,235,170):Color.FromRgb(90,66,112));
+                    b.BorderThickness=new Thickness(active?2:(editing?2:1));
+                    b.ToolTip=name+(active?" (active in-game)":string.Empty)+" • Left click: edit • Right click: menu";
+                    continue;
+                }
                 b.Background=new SolidColorBrush(editing?Color.FromRgb(98,54,140):Color.FromRgb(55,38,76));
                 b.BorderBrush=new SolidColorBrush(active?Color.FromRgb(40,235,170):Color.FromRgb(112,74,140));
                 b.BorderThickness=new Thickness(active?2:1);
                 b.Foreground=new SolidColorBrush(active?Color.FromRgb(185,255,232):Colors.White);
                 b.FontWeight=editing?FontWeights.Bold:FontWeights.Normal;
-                b.Content=_store.GetCompName(i)+(active?"  ✓":"");
+                b.Content=name+(active?"  ✓":"");
                 b.ToolTip=active?"Active in-game comp":"Click to edit • Double-click or menu to set active";
             }
             if(_addCompButton!=null)
@@ -4918,6 +5385,13 @@ namespace HDTShopWishlist
             public string NativeTribe;
             public int NativeCount;
             public int NativeTier;
+            // Confirmed dead end: PlayerLeaderboardCard.m_isNextOpponent read False across two
+            // full games (Duos and Solo, spanning multiple combat rounds each) - see
+            // HearthDb.Enums.GameTag.NEXT_OPPONENT_PLAYER_ID / _TEAMMATE_PLAYER_ID below instead,
+            // real game-state tags on the local player's own hero entity rather than a transient
+            // UI/animation flag.
+            public int NextOpponentPlayerId;
+            public int NextOpponentTeammatePlayerId;
             public object Handle;
         }
 
@@ -5022,27 +5496,36 @@ namespace HDTShopWishlist
 
         // Dump a Mono class's FIELD DESCRIPTORS (names + declared types), no instance needed.
         // Use this first to find the right static instance-holder field name before drilling in.
-        public void DumpClassFieldNamesToFile(string logPath, string className)
+        public void DumpClassFieldNamesToFile(string logPath, params string[] classNames)
         {
             try
             {
                 var img = Image;
                 using (var w = new StreamWriter(logPath, false))
                 {
-                    w.WriteLine("scan at " + DateTime.Now + " class=" + className);
+                    w.WriteLine("scan at " + DateTime.Now);
                     if (img == null) { w.WriteLine("Image is null."); return; }
-                    dynamic cls = img[className];
-                    if (cls == null) { w.WriteLine("class not found: " + className); return; }
-                    Dictionary<string, MonoClassField> fields;
-                    try { fields = (Dictionary<string, MonoClassField>)PluginReflection.TryInvoke(cls, "getFields", new object[0]); }
-                    catch (Exception ex) { w.WriteLine("getFields failed: " + ex); return; }
-                    if (fields == null) { w.WriteLine("getFields returned null"); return; }
-                    foreach (var kv in fields.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                    foreach (string className in classNames ?? new string[0])
                     {
-                        string typeName = "?"; object staticVal = null; bool hasStatic = false;
-                        try { dynamic t = kv.Value.getType(); typeName = (string)PluginReflection.TryInvoke(t, "ToString", new object[0]) ?? t.ToString(); } catch { }
-                        try { staticVal = kv.Value.getStaticValue(); hasStatic = true; } catch { }
-                        w.WriteLine("  " + kv.Key + "  : " + typeName + (hasStatic ? ("   static=" + (staticVal == null ? "null" : staticVal.ToString())) : ""));
+                        w.WriteLine("=== class=" + className + " ===");
+                        dynamic cls;
+                        // img[className] THROWS (ScryClassNotFoundException), it does not return null,
+                        // for an unresolved class - catch per class so one bad guess in the list does
+                        // not abort every class after it.
+                        try { cls = img[className]; }
+                        catch (Exception ex) { w.WriteLine("  class not found: " + ex.GetType().Name); continue; }
+                        if (cls == null) { w.WriteLine("  class not found"); continue; }
+                        Dictionary<string, MonoClassField> fields;
+                        try { fields = (Dictionary<string, MonoClassField>)PluginReflection.TryInvoke(cls, "getFields", new object[0]); }
+                        catch (Exception ex) { w.WriteLine("  getFields failed: " + ex); continue; }
+                        if (fields == null) { w.WriteLine("  getFields returned null"); continue; }
+                        foreach (var kv in fields.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                        {
+                            string typeName = "?"; object staticVal = null; bool hasStatic = false;
+                            try { dynamic t = kv.Value.getType(); typeName = (string)PluginReflection.TryInvoke(t, "ToString", new object[0]) ?? t.ToString(); } catch { }
+                            try { staticVal = kv.Value.getStaticValue(); hasStatic = true; } catch { }
+                            w.WriteLine("  " + kv.Key + "  : " + typeName + (hasStatic ? ("   static=" + (staticVal == null ? "null" : staticVal.ToString())) : ""));
+                        }
                     }
                 }
             }
@@ -5216,6 +5699,28 @@ namespace HDTShopWishlist
             return result;
         }
 
+        // Live-value diagnostic: unlike DumpClassFieldNamesToFile (static field metadata, no
+        // instance needed), this reads the actual runtime value of m_isNextOpponent (and the
+        // other rail fields) off every seat's real PlayerLeaderboardCard right now.
+        public void DumpLeaderboardTilesToFile(string logPath)
+        {
+            try
+            {
+                var tiles = ReadLeaderboardTiles();
+                using (var w = new StreamWriter(logPath, false))
+                {
+                    w.WriteLine("scan at " + DateTime.Now + " tiles=" + tiles.Count);
+                    foreach (var t in tiles)
+                    {
+                        w.WriteLine("  order=" + t.Order + " team=" + t.Team + " playerId=" + t.PlayerId
+                            + " hero=" + t.HeroCardId + " tribe=" + t.NativeTribe + " count=" + t.NativeCount
+                            + " tier=" + t.NativeTier + " nextOpp=" + t.NextOpponentPlayerId + " nextOppMate=" + t.NextOpponentTeammatePlayerId);
+                    }
+                }
+            }
+            catch (Exception ex) { try { File.WriteAllText(logPath, "DumpLeaderboardTilesToFile failed: " + ex); } catch { } }
+        }
+
         private RailTile ReadRailTileFromLeaderboardCard(dynamic card, int teamIndex, int order)
         {
             try
@@ -5241,6 +5746,11 @@ namespace HDTShopWishlist
                 playerId = FirstPositive(playerId, heroPlayerId);
                 string nativeTribe; int nativeCount; int nativeTier;
                 TryReadNativeRecentCombatsSummary(card, out nativeTribe, out nativeCount, out nativeTier);
+                // Only meaningful on the LOCAL player's own hero entity (tells them who they're
+                // about to fight), but harmless/zero to read on every seat - the caller only uses
+                // the values from whichever tile turns out to be self.
+                int nextOpponentPlayerId = PluginReflection.GetTagValueByNames(heroEntity, new[] { "NEXT_OPPONENT_PLAYER_ID" });
+                int nextOpponentTeammatePlayerId = PluginReflection.GetTagValueByNames(heroEntity, new[] { "NEXT_OPPONENT_TEAMMATE_PLAYER_ID" });
                 return new RailTile
                 {
                     Order = order, Team = teamIndex, EntityId = entityId, PlayerId = playerId,
@@ -5248,7 +5758,9 @@ namespace HDTShopWishlist
                     DuoFightsFirstKnown = hasFightsFirstTag,
                     DuoFightsFirst = fightsFirstRaw > 0,
                     HeroEntityTier = heroTier, HeroCardId = hero, NativeTribe = nativeTribe,
-                    NativeCount = nativeCount, NativeTier = nativeTier, Handle = card
+                    NativeCount = nativeCount, NativeTier = nativeTier,
+                    NextOpponentPlayerId = nextOpponentPlayerId, NextOpponentTeammatePlayerId = nextOpponentTeammatePlayerId,
+                    Handle = card
                 };
             }
             catch { return null; }
@@ -5439,6 +5951,19 @@ private static bool IsKnownLobbyTribe(string tribe)
                 catch { }
             }
             return 0;
+        }
+
+        private static bool ReadBoolPath(dynamic root, params string[] path)
+        {
+            try
+            {
+                dynamic cur = root;
+                foreach (string part in path) cur = cur?[part];
+                if (cur == null) return false;
+                try { return Convert.ToBoolean(cur); } catch { }
+                return string.Equals(Convert.ToString(cur), "True", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         private string DetectUnityVersion(Process proc)
