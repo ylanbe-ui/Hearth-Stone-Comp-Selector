@@ -77,11 +77,11 @@ echo.
 echo Le rail (paliers de tavern), le surlignage de boutique et le builder de
 echo comp fonctionnent tout de suite, sans rien de plus.
 echo.
-echo Le bouton "Skip Combat" du rail (optionnel - saute l'animation de combat)
-echo a besoin que Hearthstone Deck Tracker tourne en administrateur pour
-echo fonctionner. C'est experimental : ca coupe brievement le reseau du jeu,
-echo et ca peut occasionnellement demander deux tentatives de reconnexion.
-echo Si tu ne veux pas de ce risque, choisis un lancement normal ci-dessous.
+echo Hearthstone Deck Tracker se relance toujours en administrateur (une
+echo fenetre Windows va demander confirmation - clique "Oui") : ca garde le
+echo bouton "Skip Combat" du rail toujours disponible, et evite les
+echo comportements incoherents entre lancements normaux et mises a jour
+echo automatiques, qui relancent elles aussi en administrateur.
 echo.
 
 set "HDT_ROOT=%LOCALAPPDATA%\HearthstoneDeckTracker"
@@ -92,20 +92,10 @@ for /f "delims=" %%D in ('dir /b /ad /o-n "%HDT_ROOT%\app-*" 2^>nul') do (
 
 echo Relancer Hearthstone Deck Tracker maintenant ?
 echo   [n] Non
-echo   [o] Oui, normalement (sans le bouton Skip Combat) - RECOMMANDE
-echo   [a] Oui, en administrateur (active le bouton Skip Combat, experimental)
-set /p LAUNCH="Ton choix (n/o/a) : "
+echo   [o] Oui, en administrateur
+set /p LAUNCH="Ton choix (n/o) : "
 
 if /i "%LAUNCH%"=="o" (
-  if defined HDT_EXE (
-    start "" "%HDT_EXE%"
-  ) else (
-    echo Impossible de trouver Hearthstone Deck Tracker automatiquement. Relance-le toi-meme.
-  )
-  goto :done
-)
-
-if /i "%LAUNCH%"=="a" (
   if not defined HDT_EXE (
     echo Impossible de trouver Hearthstone Deck Tracker automatiquement. Relance-le toi-meme en admin.
     goto :done

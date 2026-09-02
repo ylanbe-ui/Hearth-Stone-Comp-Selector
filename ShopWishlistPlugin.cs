@@ -49,6 +49,14 @@ namespace HDTShopWishlist
         private volatile string _pendingUpdatePayload;
         private DateTime _updateSafeSince = DateTime.MinValue;
 
+        // Auto-relaunch watchdog state - see MaybeAutoRelaunchHearthstone below.
+        private int _watchdogHsPid;
+        private string _watchdogExePath;
+        private DateTime _watchdogLastBgMatchUtc = DateTime.MinValue;
+        private DateTime _watchdogLastPidRefreshUtc = DateTime.MinValue;
+        private DateTime _watchdogLastRelaunchUtc = DateTime.MinValue;
+        private int _watchdogRelaunchCount;
+
         public void OnLoad()
         {
             // Card art (both the full card download and the trimmed art-only download used by
@@ -227,6 +235,8 @@ namespace HDTShopWishlist
                 bool bgMatch = false;
                 try { bgMatch = game != null && PluginReflection.GetBool(game, "IsBattlegroundsMatch"); } catch { bgMatch = false; }
 
+                MaybeAutoRelaunchHearthstone(bgMatch);
+
                 if (_pendingUpdatePayload != null)
                 {
                     // Don't yank HDT away mid-match. Only apply once we've been out of a BG
@@ -279,11 +289,144 @@ namespace HDTShopWishlist
             catch (Exception ex) { Debug.WriteLine("Shop Wishlist: " + ex); }
         }
 
+        // Auto-relaunch watchdog. Covers both a Skip Combat-triggered death (MonitorOutcome only
+        // watches for 30s after a Skip Combat click) and a genuine network/client crash unrelated
+        // to Skip Combat - either way, the symptom is identical: Hearthstone.exe disappears while
+        // a BG match was live. Relaunching it turns a lost game into a ~20s interruption, since the
+        // client reconnects into the ongoing match on its own once it starts back up.
+        //
+        // Liveness is checked every call regardless of the current bgMatch reading, not only when
+        // bgMatch is false - HDT's own game-state object can plausibly stay stale for a moment right
+        // as the process dies, and gating the liveness check behind bgMatch==false would miss that.
+        // Grace window covers brief transitions (shop/combat/reconnect screen) where bgMatch might
+        // legitimately read false for a tick without anything being wrong.
+        //
+        // Opt-out: %APPDATA%\HDTShopWishlist\auto-relaunch.txt containing "0" (same pattern as
+        // skip-combat-ms.txt). Relaunching is the reasonable default given what this exists to fix,
+        // but it will also fire if the user deliberately force-closes Hearthstone mid-match - the
+        // flag exists for that case.
+        private const int AutoRelaunchGraceSeconds = 8;
+        private const int AutoRelaunchCooldownSeconds = 60;
+        private const int AutoRelaunchMaxPerSession = 5;
+        private static readonly string AutoRelaunchDisableFlagPath = IOPath.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HDTShopWishlist", "auto-relaunch.txt");
+
+        private void MaybeAutoRelaunchHearthstone(bool bgMatch)
+        {
+            try
+            {
+                if (bgMatch)
+                {
+                    _watchdogLastBgMatchUtc = DateTime.UtcNow;
+                    if (_watchdogHsPid <= 0 || (DateTime.UtcNow - _watchdogLastPidRefreshUtc).TotalSeconds >= 5)
+                    {
+                        _watchdogLastPidRefreshUtc = DateTime.UtcNow;
+                        Process proc = Process.GetProcessesByName("Hearthstone").FirstOrDefault();
+                        if (proc != null)
+                        {
+                            _watchdogHsPid = proc.Id;
+                            try { _watchdogExePath = proc.MainModule.FileName; } catch { }
+                        }
+                    }
+                }
+
+                if (_watchdogHsPid <= 0) return;
+                if ((DateTime.UtcNow - _watchdogLastBgMatchUtc).TotalSeconds > AutoRelaunchGraceSeconds)
+                {
+                    _watchdogHsPid = 0;
+                    return;
+                }
+
+                bool alive;
+                try { using (Process p = Process.GetProcessById(_watchdogHsPid)) alive = !p.HasExited; }
+                catch { alive = false; }
+                if (alive) return;
+
+                int deadPid = _watchdogHsPid;
+                _watchdogHsPid = 0;
+
+                if (ReadAutoRelaunchDisabled())
+                {
+                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
+                        + ") disappeared during a BG match, but auto-relaunch.txt=0 - not relaunching");
+                    return;
+                }
+                if ((DateTime.UtcNow - _watchdogLastRelaunchUtc).TotalSeconds < AutoRelaunchCooldownSeconds)
+                {
+                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
+                        + ") disappeared during a BG match, but still in the " + AutoRelaunchCooldownSeconds
+                        + "s cooldown from the last relaunch - not relaunching");
+                    return;
+                }
+                if (_watchdogRelaunchCount >= AutoRelaunchMaxPerSession)
+                {
+                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
+                        + ") disappeared during a BG match, but already hit the " + AutoRelaunchMaxPerSession
+                        + "-relaunch cap for this HDT session - not relaunching");
+                    return;
+                }
+                _watchdogLastRelaunchUtc = DateTime.UtcNow;
+                _watchdogRelaunchCount++;
+                // Launching Hearthstone.exe directly does not work: confirmed live - a window
+                // briefly appears and closes itself, because the game expects to be started by
+                // Battle.net with a session handshake, not run standalone from its own folder.
+                // The battlenet:// URI (registered by the Battle.net desktop client) is the same
+                // mechanism Battle.net's own "Play" button uses - it hands the game a real session.
+                // WTCG is Hearthstone's Battle.net product code (visible in the client/registry;
+                // "Warcraft Trading Card Game" was its internal codename during development).
+                try
+                {
+                    Process.Start(new ProcessStartInfo { FileName = "battlenet://WTCG", UseShellExecute = true });
+                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
+                        + ") disappeared during a BG match - relaunched via battlenet://WTCG"
+                        + " (attempt " + _watchdogRelaunchCount + "/" + AutoRelaunchMaxPerSession + ")");
+                }
+                catch (Exception ex)
+                {
+                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - battlenet:// relaunch FAILED (" + ex.GetType().Name
+                        + "), falling back to the direct exe path");
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(_watchdogExePath) && File.Exists(_watchdogExePath))
+                        {
+                            Process.Start(new ProcessStartInfo
+                            {
+                                FileName = _watchdogExePath,
+                                WorkingDirectory = IOPath.GetDirectoryName(_watchdogExePath),
+                                UseShellExecute = true
+                            });
+                            BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - fallback relaunch from " + _watchdogExePath
+                                + " (attempt " + _watchdogRelaunchCount + "/" + AutoRelaunchMaxPerSession + ")");
+                        }
+                        else
+                        {
+                            BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - no known exe path for the fallback either - giving up this attempt");
+                        }
+                    }
+                    catch (Exception ex2)
+                    {
+                        BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - fallback relaunch attempt ALSO FAILED: " + ex2);
+                    }
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine("Shop Wishlist watchdog: " + ex); }
+        }
+
+        private static bool ReadAutoRelaunchDisabled()
+        {
+            try
+            {
+                return File.Exists(AutoRelaunchDisableFlagPath)
+                    && File.ReadAllText(AutoRelaunchDisableFlagPath).Trim() == "0";
+            }
+            catch { return false; }
+        }
+
         public string Name { get { return PluginName; } }
         public string Description { get { return "Visual Battlegrounds comp builder + live shop wishlist highlight + in-game comp panel."; } }
         public string ButtonText { get { return "Open / Toggle Comp Builder"; } }
         public string Author { get { return "Ylan Benainous"; } }
-        public Version Version { get { return new Version(0, 31, 0); } }
+        public Version Version { get { return new Version(0, 32, 0); } }
         public MenuItem MenuItem
         {
             get
@@ -793,6 +936,12 @@ namespace HDTShopWishlist
         // costs nothing at 10Hz, but captures enough per shop tick to tell whether the wishlist
         // targeting genuinely disappeared upstream (pinningVm/ShopCards empty) or downstream (shop
         // cards seen, but none match the active comp). Remove once the cause is confirmed.
+        // Two independent throttles: the "gate" log runs first and unconditionally on every call,
+        // so if it shared one timestamp with the pinningVm/liveOccupied log below, it always reset
+        // the clock first and starved the second log to near-silence (confirmed live: 3 hits in
+        // 3531 lines across multiple sessions). Separate variables so both fire on their own 2s
+        // cadence regardless of call order.
+        private DateTime _lastGateLog = DateTime.MinValue;
         private DateTime _lastHighlightLog = DateTime.MinValue;
         private static readonly string HighlightDebugLogPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_highlight_debug.log");
         private static void HighlightDebugLog(string line)
@@ -873,9 +1022,9 @@ namespace HDTShopWishlist
             // if IsBattlegroundsCombatPhase ever reports stuck-true during an actual shop (a HDT-
             // side state bug, plausible after an HDT auto-update), the code below never runs and the
             // later log point never fires. This one always does, every 2s regardless of branch.
-            if ((DateTime.UtcNow - _lastHighlightLog).TotalSeconds >= 2)
+            if ((DateTime.UtcNow - _lastGateLog).TotalSeconds >= 2)
             {
-                _lastHighlightLog = DateTime.UtcNow;
+                _lastGateLog = DateTime.UtcNow;
                 HighlightDebugLog("gate bgMatch=" + bgMatch + " combatPhase=" + combatPhase
                     + " foreground=" + Native.IsForegroundHearthstone());
             }
@@ -944,7 +1093,23 @@ namespace HDTShopWishlist
                     + " liveIds=[" + string.Join(",", live) + "]"
                     + " activeComp=" + _store.ActiveCompIndex + " (" + _store.GetCompName(_store.ActiveCompIndex) + ")"
                     + " activeIdsCount=" + activeIds.Count
-                    + " matches=" + matches);
+                    + " matches=" + matches
+                    + " hsRect=(" + rect.left + "," + rect.top + "," + rect.width + "x" + rect.height + ")"
+                    + " overlayWin=(" + Left + "," + Top + "," + Width + "x" + Height + ") winOpacity=" + Opacity);
+                if (matches > 0)
+                {
+                    int firstMatchIdx = live.FindIndex(id => activeIds.Contains(id.Trim(), StringComparer.OrdinalIgnoreCase));
+                    var dbgSlots = BuildSlots(rect.width, rect.height, live.Count);
+                    var s = dbgSlots[firstMatchIdx];
+                    HighlightDebugLog("  firstMatch slotIndex=" + firstMatchIdx + " cardId=" + live[firstMatchIdx]
+                        + " normSlot=(x=" + s.x.ToString("F4") + ",y=" + s.y.ToString("F4") + ",w=" + s.w.ToString("F4") + ",h=" + s.h.ToString("F4") + ")"
+                        + " boxScreenPos=(left=" + Math.Round(rect.left + s.x * rect.width) + ",top=" + Math.Round(rect.top + s.y * rect.height)
+                        + ",w=" + Math.Round(s.w * rect.width) + ",h=" + Math.Round(s.h * rect.height) + ")"
+                        + " boxVisibility=" + _boxes[firstMatchIdx].Visibility
+                        + " boxCanvasLeft=" + Canvas.GetLeft(_boxes[firstMatchIdx]) + " boxCanvasTop=" + Canvas.GetTop(_boxes[firstMatchIdx])
+                        + " boxW=" + _boxes[firstMatchIdx].Width + " boxH=" + _boxes[firstMatchIdx].Height
+                        + " rarityIconVisible=" + ((_boxes[firstMatchIdx].Children.Count > 3 ? _boxes[firstMatchIdx].Children[3] as Image : null)?.Visibility.ToString() ?? "n/a"));
+                }
             }
 
             if (live.Count == 0)
@@ -1443,24 +1608,31 @@ namespace HDTShopWishlist
                 IntPtr h = new WindowInteropHelper(this).Handle;
                 if (h != IntPtr.Zero)
                 {
-                    Native.RegisterHotKey(h, 1338, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.W));
+                    bool ok1338 = Native.RegisterHotKey(h, 1338, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.W));
                     // Manual troubleshooting hotkey: drop and reconnect the native Battlegrounds
                     // memory binding (tavern tier/faction rail) if it ever gets stuck.
-                    Native.RegisterHotKey(h, 1339, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.R));
+                    bool ok1339 = Native.RegisterHotKey(h, 1339, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.R));
                     // Calibration aid: toggle debug outlines on every shop slot (see _debugSlotsEnabled).
-                    Native.RegisterHotKey(h, 1340, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.G));
+                    bool ok1340 = Native.RegisterHotKey(h, 1340, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.G));
                     // Investigation aid: dump Mono classes matching Tavern/Shop/Bacon to a log file.
-                    Native.RegisterHotKey(h, 1341, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.M));
+                    bool ok1341 = Native.RegisterHotKey(h, 1341, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.M));
                     // Investigation aid: dump TB_BaconShop's field names/types to a log file.
-                    Native.RegisterHotKey(h, 1342, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.F));
+                    bool ok1342 = Native.RegisterHotKey(h, 1342, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.F));
                     // Investigation aid: dump the leaderboard portrait card classes' fields, looking
                     // for whatever drives the native "who I'm fighting this round" red highlight.
-                    Native.RegisterHotKey(h, 1343, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.O));
+                    bool ok1343 = Native.RegisterHotKey(h, 1343, Native.MOD_CONTROL | Native.MOD_SHIFT, (uint)KeyInterop.VirtualKeyFromKey(Key.O));
+                    HighlightDebugLog("RegisterHotkey handle=" + h + " results: W=" + ok1338 + " R=" + ok1339
+                        + " G(debugGrid)=" + ok1340 + " M=" + ok1341 + " F=" + ok1342 + " O=" + ok1343);
+                }
+                else
+                {
+                    HighlightDebugLog("RegisterHotkey SKIPPED - window handle is Zero");
                 }
                 HwndSource src = HwndSource.FromHwnd(h);
                 if (src != null) src.AddHook(WndProc);
+                else HighlightDebugLog("RegisterHotkey - HwndSource.FromHwnd returned null, WndProc hook NOT attached");
             }
-            catch { }
+            catch (Exception ex) { HighlightDebugLog("RegisterHotkey EXCEPTION: " + ex); }
         }
 
         private void UnregisterHotkey()
@@ -1489,6 +1661,7 @@ namespace HDTShopWishlist
             {
                 handled = true;
                 _debugSlotsEnabled = !_debugSlotsEnabled;
+                HighlightDebugLog("Ctrl+Shift+G received, _debugSlotsEnabled now = " + _debugSlotsEnabled);
                 if (!_debugSlotsEnabled) for (int i = 0; i < _debugBoxes.Count; i++) { _debugBoxes[i].Visibility = Visibility.Collapsed; _debugLabels[i].Visibility = Visibility.Collapsed; }
             }
             else if (msg == Native.WM_HOTKEY && wParam.ToInt32() == 1341)
@@ -1509,6 +1682,7 @@ namespace HDTShopWishlist
                 string fieldsPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_opponent_fields.log");
                 string scanPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_leaderboard_classscan.log");
                 string valuesPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_opponent_values.log");
+                string investigationPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_nextopponent_v2.log");
                 Task.Run(delegate
                 {
                     // The exact guessed class names (best-effort) plus a broad name scan for
@@ -1520,6 +1694,9 @@ namespace HDTShopWishlist
                     // The live runtime value right now, per seat - confirms whether the field is
                     // genuinely false at this moment (wrong phase/timing) or a read bug.
                     BattlegroundsScryMemory.Instance.DumpLeaderboardTilesToFile(valuesPath);
+                    // Round 2: fresh m_isNextOpponent re-read plus m_incomingHistory/m_combatHistory,
+                    // not yet explored by any prior pass.
+                    BattlegroundsScryMemory.Instance.DumpNextOpponentInvestigationToFile(investigationPath);
                 });
             }
             return IntPtr.Zero;
@@ -2524,16 +2701,26 @@ namespace HDTShopWishlist
 
             info.PortraitOrder = seatIndex + 1;
             info.IsSelf = isSelf;
-            if (isSelf && runtime != null)
+            if (isSelf && _runtimeSelfPlayerId > 0)
             {
-                // NEXT_OPPONENT_PLAYER_ID lives on the TYPE_PLAYER entity (same place as
-                // PLAYER_TECH_LEVEL / the Duo tags - see RefreshHeroRuntimeCacheIfNeeded), not on
-                // the hero minion entity `tile` reads from a different (native Mono) path - a
-                // first attempt reading it off `tile`'s hero entity stayed at 0 all game.
-                // Only overwrite with a genuine reading - a transient 0 (e.g. mid-shop, before
-                // pairing is decided for the next round) should not clobber the last known pairing.
-                if (runtime.NextOpponentPlayerId > 0) _selfNextOpponentPlayerId = runtime.NextOpponentPlayerId;
-                if (runtime.NextOpponentTeammatePlayerId > 0) _selfNextOpponentTeammatePlayerId = runtime.NextOpponentTeammatePlayerId;
+                // Both prior approaches confirmed dead: PlayerLeaderboardCard.m_isNextOpponent
+                // read False across two full games AND re-verified at the exact moment the native
+                // red highlight was on screen (live diagnostic, 2026-09-02); the
+                // NEXT_OPPONENT_PLAYER_ID/_TEAMMATE_PLAYER_ID game tags never populate either
+                // (confirmed 0 across every sampled game). What actually works: reading
+                // PlayerLeaderboardManager.m_incomingHistory directly - a native Mono
+                // Dictionary<playerId, List<CombatEntry>> keyed by ownerId, whose last entry's
+                // opponentId/opponentTeammateId fields are the real pairing (verified live:
+                // reciprocal ownerId/opponentId pairs matching the on-screen highlight exactly).
+                // Only overwrite with a genuine reading - a transient failure (e.g. mid-shop,
+                // before pairing is decided for the next round) should not clobber the last known
+                // pairing.
+                int opp, mate;
+                if (BattlegroundsScryMemory.Instance.TryReadIncomingOpponent(_runtimeSelfPlayerId, out opp, out mate))
+                {
+                    if (opp > 0) _selfNextOpponentPlayerId = opp;
+                    if (mate > 0) _selfNextOpponentTeammatePlayerId = mate;
+                }
             }
             bool wasNextOpponent = info.IsNextOpponent;
             info.IsNextOpponent = !isSelf && info.PlayerId > 0 &&
@@ -5699,6 +5886,61 @@ namespace HDTShopWishlist
             return result;
         }
 
+        // Production read (not a diagnostic dump): resolves who ownerPlayerId is about to fight
+        // this round, straight from PlayerLeaderboardManager.m_incomingHistory - a native Mono
+        // Dictionary<playerId, List<CombatEntry>> keyed by ownerId, whose last entry's opponentId/
+        // opponentTeammateId fields are the live pairing. Verified live 2026-09-02: ownerId/
+        // opponentId pairs are reciprocal (e.g. 8<->6, 7<->5) and captured at the exact moment the
+        // native red "fighting this round" highlight was on screen. Same slot-decoding approach as
+        // TryDumpAsMonoDictionary (count==touchedSlots means no removals, so slots 0..count-1
+        // directly index keySlots/valueSlots with no free-list bookkeeping needed).
+        public bool TryReadIncomingOpponent(int ownerPlayerId, out int opponentPlayerId, out int opponentTeammatePlayerId)
+        {
+            opponentPlayerId = 0; opponentTeammatePlayerId = 0;
+            if (ownerPlayerId <= 0) return false;
+            try
+            {
+                dynamic mgr = Image?["PlayerLeaderboardManager"]?["s_instance"];
+                if (mgr == null) return false;
+                dynamic history = mgr["m_incomingHistory"];
+                if (history == null) return false;
+                dynamic keySlots = history["keySlots"];
+                dynamic valueSlots = history["valueSlots"];
+                if (keySlots == null || valueSlots == null) return false;
+
+                int dictCount = Convert.ToInt32(history["count"]);
+                int touched = Convert.ToInt32(history["touchedSlots"]);
+                int iterateTo = (dictCount == touched && dictCount > 0) ? dictCount : Math.Max(touched, 0);
+
+                for (int i = 0; i < iterateTo; i++)
+                {
+                    object kObj = keySlots[(uint)i];
+                    int key;
+                    if (kObj == null || !int.TryParse(Convert.ToString(kObj), out key) || key != ownerPlayerId) continue;
+
+                    dynamic list = valueSlots[(uint)i];
+                    if (list == null) return false;
+                    int size = Convert.ToInt32(list["_size"]);
+                    if (size <= 0) return false;
+                    dynamic items = list["_items"];
+                    object last = items[(uint)(size - 1)];
+                    if (last == null) return false;
+
+                    var fields = (Dictionary<string, object>)PluginReflection.TryInvoke(last, "getFields", new object[0]);
+                    if (fields == null) return false;
+
+                    object oppObj, mateObj;
+                    if (fields.TryGetValue("opponentId", out oppObj) && oppObj != null)
+                        int.TryParse(Convert.ToString(oppObj), out opponentPlayerId);
+                    if (fields.TryGetValue("opponentTeammateId", out mateObj) && mateObj != null)
+                        int.TryParse(Convert.ToString(mateObj), out opponentTeammatePlayerId);
+                    return opponentPlayerId > 0;
+                }
+            }
+            catch { }
+            return false;
+        }
+
         // Live-value diagnostic: unlike DumpClassFieldNamesToFile (static field metadata, no
         // instance needed), this reads the actual runtime value of m_isNextOpponent (and the
         // other rail fields) off every seat's real PlayerLeaderboardCard right now.
@@ -5719,6 +5961,182 @@ namespace HDTShopWishlist
                 }
             }
             catch (Exception ex) { try { File.WriteAllText(logPath, "DumpLeaderboardTilesToFile failed: " + ex); } catch { } }
+        }
+
+        // Second pass at "who am I fighting this round", re-verified fresh rather than trusting
+        // the prior "m_isNextOpponent always False" conclusion at face value - re-reads it live,
+        // right now, off every seat's actual PlayerLeaderboardCard (the same object ReadLeaderboardTiles
+        // already resolved, via RailTile.Handle - no separate lookup to get wrong). Also dumps
+        // PlayerLeaderboardManager's m_incomingHistory/m_combatHistory/m_oddManOutOpponentHero,
+        // unexplored fields from the same class whose names suggest round-pairing data. Trigger this
+        // at the exact moment the native red "fighting this round" highlight is visible on screen,
+        // so a False/empty result here is timing-conclusive instead of ambiguous.
+        public void DumpNextOpponentInvestigationToFile(string logPath)
+        {
+            try
+            {
+                using (var w = new StreamWriter(logPath, false))
+                {
+                    w.WriteLine("scan at " + DateTime.Now);
+
+                    var tiles = ReadLeaderboardTiles();
+                    w.WriteLine("--- fresh m_isNextOpponent per seat (tiles=" + tiles.Count + ") ---");
+                    foreach (var t in tiles)
+                    {
+                        bool flag = false;
+                        try { flag = ReadBoolPath(t.Handle as dynamic, "m_isNextOpponent"); } catch { }
+                        w.WriteLine("  order=" + t.Order + " team=" + t.Team + " playerId=" + t.PlayerId
+                            + " hero=" + t.HeroCardId + " m_isNextOpponent=" + flag);
+                    }
+
+                    w.WriteLine("--- PlayerLeaderboardManager unexplored fields ---");
+                    dynamic mgr = Image?["PlayerLeaderboardManager"]?["s_instance"];
+                    if (mgr == null) { w.WriteLine("  s_instance is null"); return; }
+                    DumpUnknownFieldOneLevel(w, mgr, "m_incomingHistory");
+                    DumpUnknownFieldOneLevel(w, mgr, "m_combatHistory");
+                    DumpUnknownFieldOneLevel(w, mgr, "m_oddManOutOpponentHero");
+                    DumpUnknownFieldOneLevel(w, mgr, "m_addedTileForPlayerId");
+                }
+            }
+            catch (Exception ex) { try { File.WriteAllText(logPath, "DumpNextOpponentInvestigationToFile failed: " + ex); } catch { } }
+        }
+
+        // Prints a field's runtime type, and if it looks like a collection (has a working
+        // .size()), each item's own fields one level deep - same "walk toward the data without
+        // guessing blind" approach DumpInstanceFieldsToFile already uses for a known root.
+        private void DumpUnknownFieldOneLevel(StreamWriter w, dynamic parent, string fieldName)
+        {
+            w.WriteLine("  " + fieldName + ":");
+            dynamic value;
+            try { value = parent?[fieldName]; }
+            catch (Exception ex) { w.WriteLine("    <read failed: " + ex.Message + ">"); return; }
+            if (value == null) { w.WriteLine("    null"); return; }
+
+            string typeName = "?";
+            try { typeName = value.GetType().FullName; } catch { }
+            w.WriteLine("    type=" + typeName);
+
+            // Mono's Dictionary<TKey,TValue> layout is separate keySlots/valueSlots/linkSlots
+            // arrays rather than a single Entry[] (that is CoreCLR's layout) - .size()/.Count/
+            // .Length all miss it, so GetDynamicCount below reads 0 and it would otherwise fall
+            // into the "not a collection" branch and dump raw array field handles instead of the
+            // actual key/value pairs.
+            if (TryDumpAsMonoDictionary(w, value)) return;
+
+            int count = GetDynamicCount(value);
+            if (count <= 0)
+            {
+                // Not a collection (or empty) - dump its own fields directly, one level.
+                Dictionary<string, object> fields = null;
+                try { fields = (Dictionary<string, object>)PluginReflection.TryInvoke(value, "getFields", new object[0]); } catch { }
+                if (fields == null) { w.WriteLine("    (not a collection, no getFields - value=" + Convert.ToString(value) + ")"); return; }
+                foreach (var kv in fields.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    string valStr;
+                    try { valStr = kv.Value == null ? "null" : Convert.ToString(kv.Value); }
+                    catch (Exception ex) { valStr = "<error: " + ex.Message + ">"; }
+                    w.WriteLine("      " + kv.Key + " = " + valStr);
+                }
+                return;
+            }
+
+            w.WriteLine("    count=" + count);
+            dynamic items = value["_items"] ?? value;
+            for (int i = 0; i < count && i < 12; i++)
+            {
+                dynamic item;
+                try { item = items[(uint)i]; } catch (Exception ex) { w.WriteLine("    [" + i + "] <index failed: " + ex.Message + ">"); continue; }
+                if (item == null) { w.WriteLine("    [" + i + "] null"); continue; }
+                Dictionary<string, object> itemFields = null;
+                try { itemFields = (Dictionary<string, object>)PluginReflection.TryInvoke(item, "getFields", new object[0]); } catch { }
+                if (itemFields == null) { w.WriteLine("    [" + i + "] (no getFields) value=" + Convert.ToString(item)); continue; }
+                w.WriteLine("    [" + i + "]:");
+                foreach (var kv in itemFields.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    string valStr;
+                    try { valStr = kv.Value == null ? "null" : Convert.ToString(kv.Value); }
+                    catch (Exception ex) { valStr = "<error: " + ex.Message + ">"; }
+                    w.WriteLine("      " + kv.Key + " = " + valStr);
+                }
+            }
+        }
+
+        // Decodes a Mono Dictionary<TKey,TValue> by its raw slot arrays. When count == touchedSlots,
+        // no entry was ever removed, so slots 0..count-1 are all live and directly index
+        // keySlots/valueSlots with no free-list bookkeeping to walk - the common case for a
+        // dictionary that is rebuilt fresh each round rather than mutated. When they differ,
+        // iterates the wider touchedSlots range instead and accepts that some slots may be stale
+        // free-list entries (best-effort; still far more signal than dumping the raw arrays).
+        private bool TryDumpAsMonoDictionary(StreamWriter w, dynamic value)
+        {
+            dynamic keySlots = null, valueSlots = null;
+            try { keySlots = value["keySlots"]; } catch { }
+            try { valueSlots = value["valueSlots"]; } catch { }
+            if (keySlots == null || valueSlots == null) return false;
+
+            int dictCount = -1, touched = -1;
+            try { dictCount = Convert.ToInt32(value["count"]); } catch { }
+            try { touched = Convert.ToInt32(value["touchedSlots"]); } catch { }
+            int iterateTo = (dictCount == touched && dictCount > 0) ? dictCount : Math.Max(touched, 0);
+            w.WriteLine("    (Mono dictionary) count=" + dictCount + " touchedSlots=" + touched
+                + " iterating 0.." + (iterateTo - 1));
+
+            for (int i = 0; i < iterateTo && i < 20; i++)
+            {
+                object k = null, v = null;
+                try { k = keySlots[(uint)i]; } catch (Exception ex) { w.WriteLine("    [" + i + "] key read failed: " + ex.Message); continue; }
+                try { v = valueSlots[(uint)i]; } catch { }
+                string kStr; try { kStr = k == null ? "null" : Convert.ToString(k); } catch (Exception ex) { kStr = "<error: " + ex.Message + ">"; }
+                w.WriteLine("    [" + i + "] key=" + kStr);
+                if (v == null) { w.WriteLine("        value=null"); continue; }
+
+                // The value here is itself a List<T> (has _items/_size) in both m_incomingHistory
+                // and m_combatHistory - one entry per round played. Drill into the LAST item (the
+                // most recent/incoming round) rather than just printing the List's own bookkeeping
+                // fields (_items/_size/etc, which say nothing about the actual pairing data).
+                dynamic vDyn = v as dynamic;
+                object listSize = null;
+                try { listSize = vDyn?["_size"]; } catch { }
+                if (listSize != null)
+                {
+                    int size = 0;
+                    try { size = Convert.ToInt32(listSize); } catch { }
+                    dynamic listItems = null;
+                    try { listItems = vDyn["_items"]; } catch { }
+                    w.WriteLine("        (List<T>) size=" + size);
+                    if (listItems != null && size > 0)
+                    {
+                        int lastIdx = size - 1;
+                        object lastItem = null;
+                        try { lastItem = listItems[(uint)lastIdx]; } catch (Exception ex) { w.WriteLine("        [last=" + lastIdx + "] read failed: " + ex.Message); }
+                        if (lastItem == null) { w.WriteLine("        [last=" + lastIdx + "] = null"); continue; }
+                        Dictionary<string, object> lastFields = null;
+                        try { lastFields = (Dictionary<string, object>)PluginReflection.TryInvoke(lastItem, "getFields", new object[0]); } catch { }
+                        if (lastFields == null) { w.WriteLine("        [last=" + lastIdx + "] value=" + Convert.ToString(lastItem)); continue; }
+                        w.WriteLine("        [last=" + lastIdx + "]:");
+                        foreach (var kv2 in lastFields.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+                        {
+                            string v2Str;
+                            try { v2Str = kv2.Value == null ? "null" : Convert.ToString(kv2.Value); }
+                            catch (Exception ex) { v2Str = "<error: " + ex.Message + ">"; }
+                            w.WriteLine("          " + kv2.Key + " = " + v2Str);
+                        }
+                    }
+                    continue;
+                }
+
+                Dictionary<string, object> vFields = null;
+                try { vFields = (Dictionary<string, object>)PluginReflection.TryInvoke(v, "getFields", new object[0]); } catch { }
+                if (vFields == null) { w.WriteLine("        value=" + Convert.ToString(v)); continue; }
+                foreach (var kv in vFields.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    string valStr;
+                    try { valStr = kv.Value == null ? "null" : Convert.ToString(kv.Value); }
+                    catch (Exception ex) { valStr = "<error: " + ex.Message + ">"; }
+                    w.WriteLine("        " + kv.Key + " = " + valStr);
+                }
+            }
+            return true;
         }
 
         private RailTile ReadRailTileFromLeaderboardCard(dynamic card, int teamIndex, int order)
