@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <RootNamespace>HDTShopWishlistInstaller</RootNamespace>
+    <AssemblyName>Install</AssemblyName>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+  </PropertyGroup>
+</Project>

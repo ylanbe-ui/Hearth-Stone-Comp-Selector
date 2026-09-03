@@ -8,13 +8,19 @@
     <LangVersion>latest</LangVersion>
     <PlatformTarget>x64</PlatformTarget>
     <Platforms>x64</Platforms>
-    <InformationalVersion>0.32.0</InformationalVersion>
+    <InformationalVersion>0.33.0</InformationalVersion>
     <OutputPath>bin\$(Configuration)\</OutputPath>
     <HDT_PATH>$(MSBuildProjectDirectory)\deps\HearthstoneDeckTracker.exe</HDT_PATH>
     <HEARTHDB_PATH>$(MSBuildProjectDirectory)\deps\HearthDb.dll</HEARTHDB_PATH>
     <SCRY_PATH>$(MSBuildProjectDirectory)\deps\untapped-scry-dotnet.dll</SCRY_PATH>
   </PropertyGroup>
   <ItemGroup>
+    <!-- The standalone installer exe lives in its own project under Installer\. This project's
+         implicit **/*.cs glob would otherwise also pull those files in as a duplicate compile
+         item (the exact class of bug that broke every build from 2026-08-21 to V28's fix - see
+         CLAUDE.md). Exclude the whole subtree explicitly rather than relying on it never
+         mattering again. -->
+    <Compile Remove="Installer\**\*.cs" />
     <Resource Include="Assets\BGCompBuilderIcon.png" />
     <None Include="Assets\BGCompBuilderIcon.png" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Assets\TribeIcons\*.png" CopyToOutputDirectory="PreserveNewest" />

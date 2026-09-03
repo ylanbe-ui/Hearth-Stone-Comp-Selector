@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" name="HDTShopWishlistInstaller"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <!--
+          Windows shows its native UAC prompt (blue shield, this exe's own name) the moment the
+          user double-clicks - no VBScript/ShellExecute "runas" relaunch trick needed, and the
+          whole process (including any child process it starts, like relaunching HDT) inherits
+          the elevated token automatically. This is the actual reason to be an exe instead of a
+          .bat: a script cannot request elevation for itself this way, it can only re-launch
+          itself elevated after already running once unelevated.
+        -->
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

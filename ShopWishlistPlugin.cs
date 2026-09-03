@@ -49,14 +49,6 @@ namespace HDTShopWishlist
         private volatile string _pendingUpdatePayload;
         private DateTime _updateSafeSince = DateTime.MinValue;
 
-        // Auto-relaunch watchdog state - see MaybeAutoRelaunchHearthstone below.
-        private int _watchdogHsPid;
-        private string _watchdogExePath;
-        private DateTime _watchdogLastBgMatchUtc = DateTime.MinValue;
-        private DateTime _watchdogLastPidRefreshUtc = DateTime.MinValue;
-        private DateTime _watchdogLastRelaunchUtc = DateTime.MinValue;
-        private int _watchdogRelaunchCount;
-
         public void OnLoad()
         {
             // Card art (both the full card download and the trimmed art-only download used by
@@ -235,8 +227,6 @@ namespace HDTShopWishlist
                 bool bgMatch = false;
                 try { bgMatch = game != null && PluginReflection.GetBool(game, "IsBattlegroundsMatch"); } catch { bgMatch = false; }
 
-                MaybeAutoRelaunchHearthstone(bgMatch);
-
                 if (_pendingUpdatePayload != null)
                 {
                     // Don't yank HDT away mid-match. Only apply once we've been out of a BG
@@ -289,144 +279,11 @@ namespace HDTShopWishlist
             catch (Exception ex) { Debug.WriteLine("Shop Wishlist: " + ex); }
         }
 
-        // Auto-relaunch watchdog. Covers both a Skip Combat-triggered death (MonitorOutcome only
-        // watches for 30s after a Skip Combat click) and a genuine network/client crash unrelated
-        // to Skip Combat - either way, the symptom is identical: Hearthstone.exe disappears while
-        // a BG match was live. Relaunching it turns a lost game into a ~20s interruption, since the
-        // client reconnects into the ongoing match on its own once it starts back up.
-        //
-        // Liveness is checked every call regardless of the current bgMatch reading, not only when
-        // bgMatch is false - HDT's own game-state object can plausibly stay stale for a moment right
-        // as the process dies, and gating the liveness check behind bgMatch==false would miss that.
-        // Grace window covers brief transitions (shop/combat/reconnect screen) where bgMatch might
-        // legitimately read false for a tick without anything being wrong.
-        //
-        // Opt-out: %APPDATA%\HDTShopWishlist\auto-relaunch.txt containing "0" (same pattern as
-        // skip-combat-ms.txt). Relaunching is the reasonable default given what this exists to fix,
-        // but it will also fire if the user deliberately force-closes Hearthstone mid-match - the
-        // flag exists for that case.
-        private const int AutoRelaunchGraceSeconds = 8;
-        private const int AutoRelaunchCooldownSeconds = 60;
-        private const int AutoRelaunchMaxPerSession = 5;
-        private static readonly string AutoRelaunchDisableFlagPath = IOPath.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HDTShopWishlist", "auto-relaunch.txt");
-
-        private void MaybeAutoRelaunchHearthstone(bool bgMatch)
-        {
-            try
-            {
-                if (bgMatch)
-                {
-                    _watchdogLastBgMatchUtc = DateTime.UtcNow;
-                    if (_watchdogHsPid <= 0 || (DateTime.UtcNow - _watchdogLastPidRefreshUtc).TotalSeconds >= 5)
-                    {
-                        _watchdogLastPidRefreshUtc = DateTime.UtcNow;
-                        Process proc = Process.GetProcessesByName("Hearthstone").FirstOrDefault();
-                        if (proc != null)
-                        {
-                            _watchdogHsPid = proc.Id;
-                            try { _watchdogExePath = proc.MainModule.FileName; } catch { }
-                        }
-                    }
-                }
-
-                if (_watchdogHsPid <= 0) return;
-                if ((DateTime.UtcNow - _watchdogLastBgMatchUtc).TotalSeconds > AutoRelaunchGraceSeconds)
-                {
-                    _watchdogHsPid = 0;
-                    return;
-                }
-
-                bool alive;
-                try { using (Process p = Process.GetProcessById(_watchdogHsPid)) alive = !p.HasExited; }
-                catch { alive = false; }
-                if (alive) return;
-
-                int deadPid = _watchdogHsPid;
-                _watchdogHsPid = 0;
-
-                if (ReadAutoRelaunchDisabled())
-                {
-                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
-                        + ") disappeared during a BG match, but auto-relaunch.txt=0 - not relaunching");
-                    return;
-                }
-                if ((DateTime.UtcNow - _watchdogLastRelaunchUtc).TotalSeconds < AutoRelaunchCooldownSeconds)
-                {
-                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
-                        + ") disappeared during a BG match, but still in the " + AutoRelaunchCooldownSeconds
-                        + "s cooldown from the last relaunch - not relaunching");
-                    return;
-                }
-                if (_watchdogRelaunchCount >= AutoRelaunchMaxPerSession)
-                {
-                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
-                        + ") disappeared during a BG match, but already hit the " + AutoRelaunchMaxPerSession
-                        + "-relaunch cap for this HDT session - not relaunching");
-                    return;
-                }
-                _watchdogLastRelaunchUtc = DateTime.UtcNow;
-                _watchdogRelaunchCount++;
-                // Launching Hearthstone.exe directly does not work: confirmed live - a window
-                // briefly appears and closes itself, because the game expects to be started by
-                // Battle.net with a session handshake, not run standalone from its own folder.
-                // The battlenet:// URI (registered by the Battle.net desktop client) is the same
-                // mechanism Battle.net's own "Play" button uses - it hands the game a real session.
-                // WTCG is Hearthstone's Battle.net product code (visible in the client/registry;
-                // "Warcraft Trading Card Game" was its internal codename during development).
-                try
-                {
-                    Process.Start(new ProcessStartInfo { FileName = "battlenet://WTCG", UseShellExecute = true });
-                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - Hearthstone (pid " + deadPid
-                        + ") disappeared during a BG match - relaunched via battlenet://WTCG"
-                        + " (attempt " + _watchdogRelaunchCount + "/" + AutoRelaunchMaxPerSession + ")");
-                }
-                catch (Exception ex)
-                {
-                    BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - battlenet:// relaunch FAILED (" + ex.GetType().Name
-                        + "), falling back to the direct exe path");
-                    try
-                    {
-                        if (!string.IsNullOrWhiteSpace(_watchdogExePath) && File.Exists(_watchdogExePath))
-                        {
-                            Process.Start(new ProcessStartInfo
-                            {
-                                FileName = _watchdogExePath,
-                                WorkingDirectory = IOPath.GetDirectoryName(_watchdogExePath),
-                                UseShellExecute = true
-                            });
-                            BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - fallback relaunch from " + _watchdogExePath
-                                + " (attempt " + _watchdogRelaunchCount + "/" + AutoRelaunchMaxPerSession + ")");
-                        }
-                        else
-                        {
-                            BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - no known exe path for the fallback either - giving up this attempt");
-                        }
-                    }
-                    catch (Exception ex2)
-                    {
-                        BattlegroundsLobbyInfoWindow.SkipLog("### WATCHDOG - fallback relaunch attempt ALSO FAILED: " + ex2);
-                    }
-                }
-            }
-            catch (Exception ex) { Debug.WriteLine("Shop Wishlist watchdog: " + ex); }
-        }
-
-        private static bool ReadAutoRelaunchDisabled()
-        {
-            try
-            {
-                return File.Exists(AutoRelaunchDisableFlagPath)
-                    && File.ReadAllText(AutoRelaunchDisableFlagPath).Trim() == "0";
-            }
-            catch { return false; }
-        }
-
         public string Name { get { return PluginName; } }
         public string Description { get { return "Visual Battlegrounds comp builder + live shop wishlist highlight + in-game comp panel."; } }
         public string ButtonText { get { return "Open / Toggle Comp Builder"; } }
         public string Author { get { return "Ylan Benainous"; } }
-        public Version Version { get { return new Version(0, 32, 0); } }
+        public Version Version { get { return new Version(0, 33, 0); } }
         public MenuItem MenuItem
         {
             get
@@ -1978,6 +1835,7 @@ namespace HDTShopWishlist
         private double _dragStartLeft;
         private double _dragStartTop;
         private Rect _lastKnownGameRect = Rect.Empty;
+        private DateTime _lastTopmostAssert = DateTime.MinValue;
 
         public InGameLauncherWindow(WishlistStore store, Action openBuilder)
         {
@@ -2085,6 +1943,7 @@ namespace HDTShopWishlist
                 }
 
                 if (Visibility != Visibility.Visible) Show();
+                ReassertTopmostIfDue();
             }
             else if (!show)
             {
@@ -2094,6 +1953,27 @@ namespace HDTShopWishlist
             {
                 Show();
             }
+        }
+
+        // WPF's Topmost=true only wins the very first time the window is placed in the always-on-
+        // top band; it does not keep re-asserting itself. HDT's own native panels (e.g. "Available
+        // Minions") are topmost too, and whichever one Windows last brought to that band wins the
+        // z-order fight between them - so this icon could end up stuck behind HDT's panel until
+        // something else nudges the z-order. Periodically forcing it back to the front of the
+        // topmost band (HWND_TOPMOST, no move/resize/activate) keeps it visible without stealing
+        // focus. Throttled since SetWindowPos every ~100ms tick would be wasteful.
+        private void ReassertTopmostIfDue()
+        {
+            if ((DateTime.UtcNow - _lastTopmostAssert).TotalSeconds < 2) return;
+            _lastTopmostAssert = DateTime.UtcNow;
+            try
+            {
+                var src = PresentationSource.FromVisual(this) as HwndSource;
+                if (src == null) return;
+                Native.SetWindowPos(src.Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                    Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+            }
+            catch { }
         }
 
         private void LauncherMouseDown(object sender, MouseButtonEventArgs e)
@@ -2123,7 +2003,12 @@ namespace HDTShopWishlist
         {
             if (!_dragging) return;
             ReleaseMouseCapture();
-            bool moved = _dragMoved;
+            // _dragMoved alone was the reported bug: if a fast drag drops/coalesces its MouseMove
+            // events, the flag can stay false even though Left/Top genuinely changed - which both
+            // opened the builder AND lost the new position (the next poll re-applies the stale
+            // stored one). Falling back to the actual position delta catches that case regardless
+            // of whether MouseMove ever got a chance to latch the flag.
+            bool moved = _dragMoved || Math.Abs(Left - _dragStartLeft) > 2 || Math.Abs(Top - _dragStartTop) > 2;
             _dragging = false;
             _dragMoved = false;
             if (moved)
@@ -2204,6 +2089,7 @@ namespace HDTShopWishlist
             public int LeaderboardPlace;
             public int NextOpponentPlayerId;
             public int NextOpponentTeammatePlayerId;
+            public int CurrentCombatPlayerId;
         }
 
         // PLAYER_TECH_LEVEL and the Duo/leaderboard tags live on the TYPE_PLAYER entity, not on the
@@ -2225,6 +2111,9 @@ namespace HDTShopWishlist
             public int LeaderboardPlace;
             public int NextOpponentPlayerId;
             public int NextOpponentTeammatePlayerId;
+            // BACON_CURRENT_COMBAT_PLAYER_ID - found by enumerating HearthDb.Enums.GameTag directly
+            // (2026-09-02) rather than guessing tag names blind. Untested until wired in below.
+            public int CurrentCombatPlayerId;
         }
 
         private readonly StackPanel _panel = new StackPanel();
@@ -2297,6 +2186,18 @@ namespace HDTShopWishlist
         // PlayerId to flag the row(s) red.
         private int _selfNextOpponentPlayerId;
         private int _selfNextOpponentTeammatePlayerId;
+        // Raw BACON_CURRENT_COMBAT_PLAYER_ID reading, logged regardless of whether it was 0 (unlike
+        // _selfNextOpponentPlayerId, which only updates on a genuine >0 read and so cannot tell a
+        // "still 0 right now" tick apart from "never updated since a stale earlier value").
+        private int _lastRawCurrentCombatPlayerId = -1;
+        // NEXT_OPPONENT_PLAYER_ID / _TEAMMATE_PLAYER_ID read DIRECTLY off game.PlayerEntity - the
+        // one entity we already know is self, with no ID-space mapping in between. Power.log
+        // (2026-09-03) shows the tag sitting on exactly that entity: "Player EntityID=2 PlayerID=1"
+        // -> "tag=NEXT_OPPONENT_PLAYER_ID value=3", right next to PLAYER_TECH_LEVEL. The earlier
+        // read went through playerTagsById, which is keyed by entity Id (2) but looked up by the
+        // hero's PLAYER_ID (1) - a different ID space - so it silently missed every time.
+        private int _selfNextOppFromPlayerEntity = -1;
+        private int _selfNextOppMateFromPlayerEntity = -1;
 
         // Temporary diagnostic for the opponent-highlight investigation - remove once resolved.
         private static readonly string OpponentDiagLogPath = IOPath.Combine(IOPath.GetTempPath(), "hdt_scry_opponent_live.log");
@@ -2400,7 +2301,9 @@ namespace HDTShopWishlist
             if ((DateTime.UtcNow - _lastOpponentHeartbeat).TotalSeconds >= 5)
             {
                 _lastOpponentHeartbeat = DateTime.UtcNow;
-                OpponentDiagLog("heartbeat selfNextOpp=" + _selfNextOpponentPlayerId + " mate=" + _selfNextOpponentTeammatePlayerId + "  "
+                OpponentDiagLog("heartbeat selfNextOpp=" + _selfNextOpponentPlayerId + " mate=" + _selfNextOpponentTeammatePlayerId
+                    + " rawPlayerEntityNextOpp=" + _selfNextOppFromPlayerEntity + " rawPlayerEntityNextOppMate=" + _selfNextOppMateFromPlayerEntity
+                    + " rawCurrentCombatPlayerId=" + _lastRawCurrentCombatPlayerId + "  "
                     + string.Join(" | ", _cachedSnapshot.Select(x =>
                     x.PortraitOrder + ":" + (x.CardId ?? "?") + " pid=" + x.PlayerId + (x.IsSelf ? "(self)" : "") + " opp=" + x.IsNextOpponent)));
             }
@@ -2701,25 +2604,27 @@ namespace HDTShopWishlist
 
             info.PortraitOrder = seatIndex + 1;
             info.IsSelf = isSelf;
-            if (isSelf && _runtimeSelfPlayerId > 0)
+            // Attempt #4, 2026-09-02: BACON_CURRENT_COMBAT_PLAYER_ID, found by enumerating every
+            // HearthDb.Enums.GameTag name directly (grep-for-the-real-name instead of guessing) and
+            // filtering for OPPONENT/NEXT/PAIR/MATCH/COMBAT. Three prior attempts confirmed dead on
+            // this exact local machine, live: m_isNextOpponent (always False, even re-read at the
+            // exact moment the native highlight was on screen), NEXT_OPPONENT_PLAYER_ID/_TEAMMATE_
+            // PLAYER_ID tags (always 0), and PlayerLeaderboardManager.m_incomingHistory/
+            // m_combatHistory (POST-combat results only - damage/isDefeated/winStreak cannot be
+            // known before a fight, so that data answers "who did I just fight" not "who's next").
+            // Logged every heartbeat below so a wrong/always-0 read is visible without needing
+            // another live round trip if this also turns out to be a dead end.
+            if (isSelf)
             {
-                // Both prior approaches confirmed dead: PlayerLeaderboardCard.m_isNextOpponent
-                // read False across two full games AND re-verified at the exact moment the native
-                // red highlight was on screen (live diagnostic, 2026-09-02); the
-                // NEXT_OPPONENT_PLAYER_ID/_TEAMMATE_PLAYER_ID game tags never populate either
-                // (confirmed 0 across every sampled game). What actually works: reading
-                // PlayerLeaderboardManager.m_incomingHistory directly - a native Mono
-                // Dictionary<playerId, List<CombatEntry>> keyed by ownerId, whose last entry's
-                // opponentId/opponentTeammateId fields are the real pairing (verified live:
-                // reciprocal ownerId/opponentId pairs matching the on-screen highlight exactly).
-                // Only overwrite with a genuine reading - a transient failure (e.g. mid-shop,
-                // before pairing is decided for the next round) should not clobber the last known
-                // pairing.
-                int opp, mate;
-                if (BattlegroundsScryMemory.Instance.TryReadIncomingOpponent(_runtimeSelfPlayerId, out opp, out mate))
+                // Primary: the tag straight off game.PlayerEntity (see _selfNextOppFromPlayerEntity).
+                // Only overwrite on a genuine >0 read so a transient 0 keeps the last known pairing.
+                if (_selfNextOppFromPlayerEntity > 0) _selfNextOpponentPlayerId = _selfNextOppFromPlayerEntity;
+                if (_selfNextOppMateFromPlayerEntity > 0) _selfNextOpponentTeammatePlayerId = _selfNextOppMateFromPlayerEntity;
+                if (runtime != null)
                 {
-                    if (opp > 0) _selfNextOpponentPlayerId = opp;
-                    if (mate > 0) _selfNextOpponentTeammatePlayerId = mate;
+                    _lastRawCurrentCombatPlayerId = runtime.CurrentCombatPlayerId;
+                    if (_selfNextOppFromPlayerEntity <= 0 && runtime.CurrentCombatPlayerId > 0)
+                        _selfNextOpponentPlayerId = runtime.CurrentCombatPlayerId;
                 }
             }
             bool wasNextOpponent = info.IsNextOpponent;
@@ -2827,6 +2732,10 @@ namespace HDTShopWishlist
                     PluginReflection.GetInt(playerEntity, "Id"),
                     PluginReflection.GetInt(playerEntity, "EntityId"));
                 _runtimeSelfHeroCardId = FirstText(PluginReflection.GetString(playerEntity, "CardId"), PluginReflection.GetString(playerEntity, "CardID"));
+                // Raw every refresh (0 included) so the heartbeat can distinguish "tag absent right
+                // now" from "never read" - see _selfNextOppFromPlayerEntity.
+                _selfNextOppFromPlayerEntity = PluginReflection.GetTagValueByNames(playerEntity, new[] { "NEXT_OPPONENT_PLAYER_ID" });
+                _selfNextOppMateFromPlayerEntity = PluginReflection.GetTagValueByNames(playerEntity, new[] { "NEXT_OPPONENT_TEAMMATE_PLAYER_ID" });
 
                 var playerTagsById = new Dictionary<int, PlayerTagState>();
                 foreach (object entity in PluginReflection.EnumerateEntities(game))
@@ -2846,7 +2755,8 @@ namespace HDTShopWishlist
                         DuoFightsFirst = PluginReflection.GetTagValueByNames(entity, new[] { "BACON_DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT", "DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT" }) > 0,
                         LeaderboardPlace = PluginReflection.GetTagValueByNames(entity, new[] { "PLAYER_LEADERBOARD_PLACE", "LEADERBOARD_PLACE" }),
                         NextOpponentPlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "NEXT_OPPONENT_PLAYER_ID" }),
-                        NextOpponentTeammatePlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "NEXT_OPPONENT_TEAMMATE_PLAYER_ID" })
+                        NextOpponentTeammatePlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "NEXT_OPPONENT_TEAMMATE_PLAYER_ID" }),
+                        CurrentCombatPlayerId = PluginReflection.GetTagValueByNames(entity, new[] { "BACON_CURRENT_COMBAT_PLAYER_ID" })
                     };
                 }
 
@@ -2875,7 +2785,7 @@ namespace HDTShopWishlist
                     bool hasFightsFirstTag = PluginReflection.HasTag(entity, "BACON_DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT") || PluginReflection.HasTag(entity, "DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT");
                     int fightsFirstRaw = PluginReflection.GetTagValueByNames(entity, new[] { "BACON_DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT", "DUO_PLAYER_FIGHTS_FIRST_NEXT_COMBAT" });
 
-                    int nextOpponentPlayerId = 0, nextOpponentTeammatePlayerId = 0;
+                    int nextOpponentPlayerId = 0, nextOpponentTeammatePlayerId = 0, currentCombatPlayerId = 0;
                     PlayerTagState playerTags;
                     if (playerId > 0 && playerTagsById.TryGetValue(playerId, out playerTags))
                     {
@@ -2886,9 +2796,10 @@ namespace HDTShopWishlist
                         if (playerTags.LeaderboardPlace > 0) leaderboardPlace = playerTags.LeaderboardPlace;
                         nextOpponentPlayerId = playerTags.NextOpponentPlayerId;
                         nextOpponentTeammatePlayerId = playerTags.NextOpponentTeammatePlayerId;
+                        currentCombatPlayerId = playerTags.CurrentCombatPlayerId;
                     }
 
-                    _heroRuntimeCache.Add(new HeroRuntimeState { PlayerId = playerId, EntityId = entityId, CardId = card, CurrentHealth = currentHealth, HasHealthData = hasHealthData, IsHeroInPlay = PluginReflection.GetBool(entity, "IsInPlay"), TavernTier = heroTier, DuoTeam = duoTeam, DuoTeamKnown = duoTeamKnown, DuoTeammatePlayerId = duoMate, DuoFightsFirstKnown = hasFightsFirstTag, DuoFightsFirst = fightsFirstRaw > 0, LeaderboardPlace = leaderboardPlace, NextOpponentPlayerId = nextOpponentPlayerId, NextOpponentTeammatePlayerId = nextOpponentTeammatePlayerId });
+                    _heroRuntimeCache.Add(new HeroRuntimeState { PlayerId = playerId, EntityId = entityId, CardId = card, CurrentHealth = currentHealth, HasHealthData = hasHealthData, IsHeroInPlay = PluginReflection.GetBool(entity, "IsInPlay"), TavernTier = heroTier, DuoTeam = duoTeam, DuoTeamKnown = duoTeamKnown, DuoTeammatePlayerId = duoMate, DuoFightsFirstKnown = hasFightsFirstTag, DuoFightsFirst = fightsFirstRaw > 0, LeaderboardPlace = leaderboardPlace, NextOpponentPlayerId = nextOpponentPlayerId, NextOpponentTeammatePlayerId = nextOpponentTeammatePlayerId, CurrentCombatPlayerId = currentCombatPlayerId });
                 }
             }
             catch { }
@@ -3049,6 +2960,16 @@ namespace HDTShopWishlist
             _heroRuntimeCache.Clear();
             _runtimeSelfPlayerId = 0;
             _runtimeSelfHeroCardId = null;
+            // Never reset before this fix: a stale pairing from the previous match (or round, if
+            // TryReadIncomingOpponent happened to fail right on a round transition) could survive
+            // and highlight the wrong seat as "fighting this round" - playerId 1-8 is reused every
+            // match, so a leftover value from last game reliably points at *someone*, just not the
+            // right one. Reported live 2026-09-02 ("c'est pas le bon adversaire").
+            _selfNextOpponentPlayerId = 0;
+            _selfNextOpponentTeammatePlayerId = 0;
+            _lastRawCurrentCombatPlayerId = -1;
+            _selfNextOppFromPlayerEntity = -1;
+            _selfNextOppMateFromPlayerEntity = -1;
             _tierBaselineByIdentity.Clear();
             _levelUpTurnByIdentity.Clear();
             _nativeSeatCursor = 0;
@@ -5975,8 +5896,13 @@ namespace HDTShopWishlist
         {
             try
             {
-                using (var w = new StreamWriter(logPath, false))
+                // Append, not overwrite: the whole point of pressing this hotkey multiple times in
+                // one session (e.g. once at end-of-combat, once at start-of-shop) is to compare
+                // captures - overwriting silently threw away the first press every time before this.
+                using (var w = new StreamWriter(logPath, true))
                 {
+                    w.WriteLine();
+                    w.WriteLine("================================================================");
                     w.WriteLine("scan at " + DateTime.Now);
 
                     var tiles = ReadLeaderboardTiles();
@@ -5989,16 +5915,138 @@ namespace HDTShopWishlist
                             + " hero=" + t.HeroCardId + " m_isNextOpponent=" + flag);
                     }
 
-                    w.WriteLine("--- PlayerLeaderboardManager unexplored fields ---");
                     dynamic mgr = Image?["PlayerLeaderboardManager"]?["s_instance"];
                     if (mgr == null) { w.WriteLine("  s_instance is null"); return; }
+
+                    // Kitchen-sink pass: rather than guessing one field at a time across several
+                    // live captures (costing the user a lost/replayed game each round), dump every
+                    // field HDT's own memory access already resolves for us, at every level - the
+                    // manager itself, every team, every card in every team, and each team's FSM.
+                    // Bigger log, but one capture answers everything instead of needing a follow-up.
+                    w.WriteLine("--- PlayerLeaderboardManager: ALL top-level fields ---");
+                    DumpAllFieldsShallow(w, mgr, "  ");
+
+                    // The two dictionaries decode to garbage under plain getFields() (their content
+                    // lives in raw keySlots/valueSlots arrays) - keep the dedicated decoder for them
+                    // specifically, everything else uses the generic shallow dump above/below.
+                    w.WriteLine("--- m_incomingHistory (decoded) ---");
                     DumpUnknownFieldOneLevel(w, mgr, "m_incomingHistory");
+                    w.WriteLine("--- m_combatHistory (decoded) ---");
                     DumpUnknownFieldOneLevel(w, mgr, "m_combatHistory");
-                    DumpUnknownFieldOneLevel(w, mgr, "m_oddManOutOpponentHero");
-                    DumpUnknownFieldOneLevel(w, mgr, "m_addedTileForPlayerId");
+
+                    w.WriteLine("--- Teams, cards, and FSMs: ALL fields ---");
+                    dynamic teams = mgr["m_teams"]?["_items"];
+                    int teamCount = GetDynamicCount(teams);
+                    w.WriteLine("  teamCount=" + teamCount);
+                    for (int t = 0; t < teamCount; t++)
+                    {
+                        dynamic team = null;
+                        try { team = teams[(uint)t]; } catch (Exception ex) { w.WriteLine("  team[" + t + "] index failed: " + ex.Message); }
+                        if (team == null) { w.WriteLine("  team[" + t + "] = null"); continue; }
+
+                        w.WriteLine("  team[" + t + "] ALL fields:");
+                        DumpAllFieldsShallow(w, team, "    ");
+
+                        dynamic playmakerComponent = null;
+                        try { playmakerComponent = team["m_teamPlaymaker"]; } catch { }
+                        dynamic fsm = null;
+                        try { fsm = playmakerComponent != null ? playmakerComponent["fsm"] : null; } catch { }
+                        if (fsm != null)
+                        {
+                            // The PlayMakerFSM Unity component is just a wrapper - the state machine
+                            // itself (and the active state name) lives one level deeper on its "fsm"
+                            // field (type HutongGames.PlayMaker.Fsm).
+                            w.WriteLine("    m_teamPlaymaker.fsm ALL fields:");
+                            DumpAllFieldsShallow(w, fsm, "      ");
+                        }
+                        else
+                        {
+                            w.WriteLine("    m_teamPlaymaker.fsm = null (or m_teamPlaymaker itself was null)");
+                        }
+
+                        dynamic cards = null;
+                        try { cards = team["m_playerLeaderboardCards"]?["_items"]; } catch { }
+                        int cardCount = GetDynamicCount(cards);
+                        for (int c = 0; c < cardCount; c++)
+                        {
+                            dynamic card = null;
+                            try { card = cards[(uint)c]; } catch (Exception ex) { w.WriteLine("    card[" + c + "] index failed: " + ex.Message); }
+                            if (card == null) { w.WriteLine("    card[" + c + "] = null"); continue; }
+                            w.WriteLine("    card[" + c + "] ALL fields:");
+                            DumpAllFieldsShallow(w, card, "      ");
+
+                            // Both PlayerLeaderboardCard and PlayerLeaderboardTeam carry an
+                            // m_IconSwords GameObject - a crossed-swords icon is exactly the kind
+                            // of element the game would show/hide for "you'll fight this one",
+                            // unlike a hidden data field. GameObject.activeSelf/activeInHierarchy
+                            // are C# properties (not fields), so getFields() above would not have
+                            // shown their value even though it listed the field itself.
+                            dynamic swordsIcon = null;
+                            try { swordsIcon = card["m_IconSwords"]; } catch { }
+                            w.WriteLine("      m_IconSwords.active=" + DescribeGameObjectActive(swordsIcon));
+
+                            // m_isNextOpponent on the CARD is confirmed dead (always False, even at
+                            // the exact moment the native red glow is on screen). But the glow could
+                            // be driven by a flag on the CHILD Actor component instead - Unity scenes
+                            // commonly duplicate state across a data wrapper and its visual actor, and
+                            // only one copy ends up being the one that actually drives rendering.
+                            foreach (string actorField in new[] { "m_tileActor", "m_mainCardActor" })
+                            {
+                                dynamic actor = null;
+                                try { actor = card[actorField]; } catch { }
+                                if (actor == null) { w.WriteLine("      " + actorField + " = null"); continue; }
+                                w.WriteLine("      " + actorField + " ALL fields:");
+                                DumpAllFieldsShallow(w, actor, "        ");
+                            }
+                        }
+
+                        dynamic teamSwordsIcon = null;
+                        try { teamSwordsIcon = team["m_IconSwords"]; } catch { }
+                        w.WriteLine("    team[" + t + "].m_IconSwords.active=" + DescribeGameObjectActive(teamSwordsIcon));
+                        dynamic teamSkullIcon = null;
+                        try { teamSkullIcon = team["m_IconSkull"]; } catch { }
+                        w.WriteLine("    team[" + t + "].m_IconSkull.active=" + DescribeGameObjectActive(teamSkullIcon));
+                    }
                 }
             }
             catch (Exception ex) { try { File.WriteAllText(logPath, "DumpNextOpponentInvestigationToFile failed: " + ex); } catch { } }
+        }
+
+        // GameObject.activeSelf / activeInHierarchy are C# properties, not fields - getFields()
+        // does not surface them. Try the bare property name first (matches the working
+        // fsm.ActiveStateName pattern used above), fall back to the explicit get_ accessor name
+        // in case TryInvoke needs that instead - whichever this dynamic proxy actually supports.
+        private static string DescribeGameObjectActive(dynamic gameObject)
+        {
+            if (gameObject == null) return "<null GameObject>";
+            return "activeSelf=" + Convert.ToString(TryReadProperty(gameObject, "activeSelf"))
+                + " activeInHierarchy=" + Convert.ToString(TryReadProperty(gameObject, "activeInHierarchy"));
+        }
+
+        private static object TryReadProperty(dynamic instance, string propertyName)
+        {
+            try { object v = PluginReflection.TryInvoke(instance, propertyName, new object[0]); if (v != null) return v; } catch { }
+            try { return PluginReflection.TryInvoke(instance, "get_" + propertyName, new object[0]); } catch { }
+            return null;
+        }
+
+        // Dumps every field a live instance reports via getFields(), one level, no recursion into
+        // nested objects (those get their own explicit dump call where useful, so this stays fast
+        // and does not risk an infinite/huge walk through a cyclic Unity object graph).
+        private void DumpAllFieldsShallow(StreamWriter w, dynamic instance, string indent)
+        {
+            if (instance == null) { w.WriteLine(indent + "(null)"); return; }
+            Dictionary<string, object> fields = null;
+            try { fields = (Dictionary<string, object>)PluginReflection.TryInvoke(instance, "getFields", new object[0]); }
+            catch (Exception ex) { w.WriteLine(indent + "(getFields threw: " + ex.Message + ")"); return; }
+            if (fields == null) { w.WriteLine(indent + "(getFields returned null)"); return; }
+            foreach (var kv in fields.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                string vs;
+                try { vs = kv.Value == null ? "null" : Convert.ToString(kv.Value); }
+                catch (Exception ex) { vs = "<error: " + ex.Message + ">"; }
+                w.WriteLine(indent + kv.Key + " = " + vs);
+            }
         }
 
         // Prints a field's runtime type, and if it looks like a collection (has a working
@@ -6412,7 +6460,8 @@ private static bool IsKnownLobbyTribe(string tribe)
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd,out RECT rect);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-        public const uint SWP_NOZORDER=0x0004; public const uint SWP_NOACTIVATE=0x0010;
+        public const uint SWP_NOZORDER=0x0004; public const uint SWP_NOACTIVATE=0x0010; public const uint SWP_NOMOVE=0x0002; public const uint SWP_NOSIZE=0x0001;
+        public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd,out uint processId);
         [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd,int nIndex);
